@@ -1,0 +1,65 @@
+# FaceKeep on a NAS — a docker-compose wrapper over the two-target Dockerfile
+# (see ../Dockerfile). Targets Synology Container Manager / QNAP Container
+# Station / Unraid / plain `docker compose` — anything that speaks Compose.
+#
+# The default `facekeep` service is the lean faithful (slim) image and runs a
+# one-shot batch backup: compress everything under the mounted photo folder into
+# the output folder, then exit (ideal for a scheduled task). The opt-in `ai`
+# service (behind the `ai` profile, so a plain run never pulls the multi-GB
+# image) adds aggressive-mode AI restore.
+#
+# Quick start (point it at your NAS share):
+#   FACEKEEP_PHOTOS=/volume1/photos FACEKEEP_OUT=/volume1/compressed \
+#     docker compose run --rm facekeep
+#
+# Full Synology + scheduling guide: docs/nas.md
+#
+# No top-level `version:` key — it is obsolete in the Compose Spec (Compose v2,
+# which Synology Container Manager and modern Docker use, ignores it).
+
+services:
+  # --- faithful batch backup (default) -------------------------------------
+  facekeep:
+    build:
+      context: .
+      target: slim
+    image: facekeep:slim
+    # Outputs are owned by this uid:gid on the host. Set PUID/PGID to your NAS
+    # user so compressed files belong to you; defaults to the image's app user.
+    user: "${PUID:-10001}:${PGID:-10001}"
+    volumes:
+      # Source photos, mounted READ-ONLY: a backup tool must never touch originals.
+      - "${FACEKEEP_PHOTOS:-./photos}:/work/photos:ro"
+      # Compressed output. The incremental index (.facekeep-index.sqlite) also
+      # lives here, so scheduled re-runs skip unchanged photos.
+      - "${FACEKEEP_OUT:-./compressed}:/work/compressed"
+    # One-shot backup. Override with any `facekeep` command, e.g.:
+    #   docker compose run --rm facekeep info /work/compressed/x.fkeep
+    command: ["compress", "/work/photos", "-o", "/work/compressed"]
+    restart: "no"
+
+  # --- aggressive-mode AI restore (opt-in: `--profile ai`) -----------------
+  ai:
+    profiles: ["ai"]
+    build:
+      context: .
+      target: ai
+    image: facekeep:ai
+    # No `user:` override here on purpose: the model-cache named volume below is
+    # owned by the image's app user (uid 10001), so running as that user keeps
+    # weight downloads writable. See docs/nas.md before changing it.
+    volumes:
+      - "${FACEKEEP_PHOTOS:-./photos}:/work/photos:ro"
+      - "${FACEKEEP_OUT:-./compressed}:/work/compressed"
+      # Persist downloaded AI weights (~/.cache/facekeep) across runs so they are
+      # fetched once. Path matches the Dockerfile's HOME (/home/app).
+      - "facekeep-models:/home/app/.cache/facekeep"
+    # Example: aggressive compress to .fkeep. The other common command is restore:
+    #   docker compose --profile ai run --rm ai \
+    #     restore /work/compressed/x.fkeep -o /work/compressed/ --tile 512
+    command: ["compress", "/work/photos", "-m", "aggressive", "-o", "/work/compressed"]
+    restart: "no"
+
+volumes:
+  # Named volume for the AI model cache (Real-ESRGAN / GFPGAN weights).
+  facekeep-models:

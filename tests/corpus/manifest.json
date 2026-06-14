@@ -1,0 +1,83 @@
+{
+  "_comment": [
+    "Real-photo test corpus for FaceKeep (ROADMAP Phase 2). These images are NOT",
+    "committed to the repo — download.py fetches them into a local cache and the",
+    "corpus tests skip when the cache is absent (e.g. offline / CI). All entries",
+    "are license-clear (Public Domain or CC-BY/CC-BY-SA with attribution recorded",
+    "below); the URL is a Wikimedia Commons Special:FilePath redirect (?width=800",
+    "keeps each file small). 'sha256' is the digest of the exact bytes that URL",
+    "served at capture time — download.py verifies it, so a silently changed file",
+    "fails loudly instead of corrupting a test. 'faces' is the count Haar detected",
+    "on the loaded image at capture (used to choose detection assertions, not as a",
+    "strict oracle). See README.md."
+  ],
+  "width_param": 800,
+  "images": [
+    {
+      "filename": "obama_portrait.jpg",
+      "title": "File:Official portrait of Barack Obama.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Official_portrait_of_Barack_Obama.jpg?width=800",
+      "license": "CC BY 3.0",
+      "attribution": "Pete Souza, The Obama-Biden Transition Project",
+      "source_page": "https://commons.wikimedia.org/wiki/File:Official_portrait_of_Barack_Obama.jpg",
+      "sha256": "1ae6557acb9a44b9fafaf55f6b4a806c95cef51be038a152dc791dba3166400a",
+      "faces": 1,
+      "note": "Single clear frontal portrait."
+    },
+    {
+      "filename": "einstein_head.jpg",
+      "title": "File:Albert Einstein Head.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Albert_Einstein_Head.jpg?width=800",
+      "license": "Public domain",
+      "attribution": "Orren Jack Turner (restored)",
+      "source_page": "https://commons.wikimedia.org/wiki/File:Albert_Einstein_Head.jpg",
+      "sha256": "96b2bb5f11e3329a00b7d5a1ce6bc58854062f1fd003a27d33408ac019125841",
+      "faces": 1,
+      "note": "Grayscale (mode L) source — exercises the load path on a single-channel original."
+    },
+    {
+      "filename": "beatles_group.jpg",
+      "title": "File:Beatles ad 1965 just the beatles crop.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Beatles_ad_1965_just_the_beatles_crop.jpg?width=800",
+      "license": "Public domain",
+      "attribution": "EMI (publicity photo)",
+      "source_page": "https://commons.wikimedia.org/wiki/File:Beatles_ad_1965_just_the_beatles_crop.jpg",
+      "sha256": "78d355886a2129e78c3555af99f526b54a32b1fbfd04a2277a55ca8ea861f1d2",
+      "faces": 5,
+      "note": "Multi-face group — drives the 'detect several faces' assertion."
+    },
+    {
+      "filename": "snake_river.jpg",
+      "title": "File:Snake River (5mb).jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Snake_River_(5mb).jpg?width=800",
+      "license": "Public domain",
+      "attribution": "Adumbvoget",
+      "source_page": "https://commons.wikimedia.org/wiki/File:Snake_River_(5mb).jpg",
+      "sha256": "436f6d6a67389d70c436c4beadbaee4575dcfd2a00c0055c7f1e78dce0909169",
+      "faces": 0,
+      "note": "Faceless landscape."
+    },
+    {
+      "filename": "hopetoun_falls.jpg",
+      "title": "File:Hopetoun falls.jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Hopetoun_falls.jpg?width=800",
+      "license": "CC BY-SA 3.0",
+      "attribution": "Diliff",
+      "source_page": "https://commons.wikimedia.org/wiki/File:Hopetoun_falls.jpg",
+      "sha256": "6ed654ef01f548c349e3078bd33f3c841875c5f98db17d811c62c568cd2d516d",
+      "faces": 0,
+      "note": "Faceless landscape (waterfall)."
+    },
+    {
+      "filename": "migrant_mother.jpg",
+      "title": "File:Migrant Mother (LOC fsa.8b29516).jpg",
+      "url": "https://commons.wikimedia.org/wiki/Special:FilePath/Migrant%20Mother%20%28LOC%20fsa.8b29516%29.jpg?width=2400",
+      "license": "Public domain",
+      "attribution": "Dorothea Lange, U.S. Library of Congress",
+      "source_page": "https://commons.wikimedia.org/wiki/File:Migrant_Mother_(LOC_fsa.8b29516).jpg",
+      "sha256": "3ac95cfd6417d735daa1b2c9047f71ca8d7229bf4ab3a45f717e704414dbd417",
+      "faces": 2,
+      "note": "Large frame (3840x4929) with faces a small fraction of the image, so aggressive mode's downsample genuinely saves bytes (ratio>1) — unlike the 800px renders where faces fill the frame. Drives the aggressive ratio/restore-LPIPS regression lock (test_corpus_aggressive_regression.py). One large + one small/distant face, so region-local conservatism fires."
+    }
+  ]
+}

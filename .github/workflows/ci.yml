@@ -1,0 +1,95 @@
+name: CI
+
+# Continuous regression protection for the work that has accumulated on main:
+# faithful/aggressive pipelines, the codec paths, the detector plugin hook, and
+# the PyPI packaging. Runs on every push and PR.
+#
+# Offline-first is preserved here too: CI installs only the core + dev tooling
+# (`.[dev]`), never the `[ai]` / `[detect]` / `[heic]` extras. So the AI-restore,
+# MediaPipe, and HEIC tests skip on CI exactly as they do on a fresh default
+# machine, and the real-photo corpus locks skip (the images aren't in the repo).
+# That is the honest default-install signal — CI proves the offline default works,
+# not the opt-in network paths. (`-rs` surfaces every skip reason in the log so a
+# skip is never mistaken for a pass.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same ref cancels an in-flight run for it.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install ruff
+        run: python -m pip install --upgrade pip ruff
+      - name: ruff check
+        run: ruff check facekeep/
+
+  test:
+    name: tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # The suite runs in well under this on CI (the real-photo corpus locks skip —
+    # images aren't in the repo — and `spawn` worker pools add some startup cost);
+    # the cap exists so a hang (e.g. a deadlocked worker pool) fails fast instead
+    # of burning the 6h ceiling, not as a tight performance bound.
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Match pyproject's requires-python = ">=3.10" classifiers.
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install (core + dev tooling only — offline-first, no AI/detect/heic extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run the suite (one fresh process per test file)
+        # Plain `pytest -q` segfaults part-way through as native libs accumulate
+        # state across tests in one interpreter; run_suite.py launches a fresh
+        # `python -m pytest <file>` per file, which is the reliable green signal.
+        # `-rs` prints each skip's reason (corpus / MediaPipe skips are expected).
+        run: python tests/run_suite.py -- -rs
+
+  build:
+    name: build + twine check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+      - name: Build sdist + wheel
+        # Single-source dynamic version (facekeep.__version__) resolves here.
+        run: python -m build
+      - name: Validate distribution metadata
+        run: twine check dist/*
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/*
+          retention-days: 14

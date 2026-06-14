@@ -1,0 +1,54 @@
+# FaceKeep configuration. Place this as ./facekeep.yaml or
+# ~/.config/facekeep/config.yaml. CLI flags override these values.
+# All keys are optional; anything omitted uses the built-in default shown here.
+
+# Which mode to use: faithful (default) or aggressive.
+#   faithful  - whole-image AVIF/JXL, real pixels, single standard file, no
+#               restore step. Visually lossless, ~2.5-3x smaller than JPEG.
+#   aggressive- crop faces + downsample background + AI restore, .fkeep output.
+#               Extreme compression; background is reconstructed on restore.
+# Left commented so `preset:` below (which implies aggressive) can be enabled
+# without editing two lines — an explicit `mode:` in the same file as a
+# `preset:` is a contradiction and errors loudly.
+# mode: faithful
+
+# Optional aggressive-mode preset: one word that tunes the aggressive knobs
+# toward a goal (implies `mode: aggressive`). Any key you write explicitly in
+# this file still wins over the preset. CLI equivalent: `compress --preset`.
+#   ratio:    smallest .fkeep (1/8 background, modern codecs everywhere)
+#   pretty:   best-looking restore (best available face enhancer, beauty-leaning)
+#   fidelity: closest to the original (stores the real residual; larger .fkeep)
+#   family:   max face/hand protection (YuNet + MediaPipe hands + upper-body ROI)
+#   share:    ratio + strip GPS (small and private, for sending out)
+# preset: family
+
+# Face detection (shared by both modes).
+detector:
+  backend: haar       # haar (bundled, offline) | yunet (DNN, auto-downloads model)
+  confidence: 0.6     # min detection confidence (yunet only)
+  padding: 1.5        # padding multiplier around each detected face box
+
+# Faithful mode settings.
+faithful:
+  codec: avif              # avif | jxl
+  quality: 70              # used when auto_tune is off, or as the search fallback
+  speed: 6                 # AVIF encoder effort 0-10 (lower = slower, smaller)
+  auto_tune: true          # search for a visually-lossless quality (on by default).
+                           #   An explicit `--quality` on the CLI turns this off.
+  target_metric: ssimulacra2  # ssimulacra2 (perceptual, default) | ssim. ssimulacra2
+                           #   needs the [dev] extra; a plain install falls back to
+                           #   SSIM automatically (threshold re-based). Higher = better.
+  target_value: 90.0       # acceptance threshold (SSIMULACRA2 scale; ~90 = visually
+                           #   lossless). Use ~0.985 if target_metric is ssim.
+  chroma: auto             # auto (4:4:4 when faces present) | 444 | 420
+
+# Aggressive mode settings.
+aggressive:
+  bg_scale: 0.25      # background downsample factor (0.25 = 1/4)
+  bg_quality: 85      # JPEG quality for the downsampled background
+  face_quality: 95    # face-crop quality; >=100 stores faces as lossless PNG
+  no_face_strategy: conservative  # conservative | skip | normal
+  no_face_bg_scale: 0.5           # bg_scale used when no faces are found
+  model: realesrgan-x4plus        # super-resolution model (needs [ai] extra)
+  face_enhance: true              # GFPGAN face restoration on restore
+  blend_mode: gaussian            # gaussian | linear | poisson

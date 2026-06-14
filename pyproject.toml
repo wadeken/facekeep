@@ -1,0 +1,130 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "facekeep"
+# Single source of truth is facekeep.__version__ (see [tool.setuptools.dynamic]),
+# so the package and the distribution metadata can never drift apart.
+dynamic = ["version"]
+description = "Face-aware photo compression that never ruins a face: shrink a family photo library ~8-12x with faces/hands/detail kept pixel-perfect (aggressive mode), plus a faithful visually-lossless default mode"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["image-compression", "avif", "jpeg-xl", "face-detection", "photo-backup"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics",
+]
+
+# Core dependencies: faithful mode works with just these (no AI, no mediapipe).
+dependencies = [
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "pillow-avif-plugin>=1.4.0",
+    "pillow-jxl-plugin>=1.2.0",
+    "piexif>=1.1.3",
+    "scikit-image>=0.22.0",
+    "click>=8.0.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# NOTE: True 10/12-bit AVIF *output* (high-bit sources without banding) is NOT a
+# pip extra — it uses the external `avifenc` CLI (libavif), which is not a Python
+# package. It is opt-in and machine-local: put `avifenc` on PATH or set
+# $FACEKEEP_AVIFENC to its path. Without it, high-bit sources gracefully round
+# down to 8-bit with a warning (offline-first default unchanged).
+#
+# Aggressive mode's AI super-resolution restore.
+ai = [
+    "realesrgan>=0.3.0",
+    "basicsr>=1.4.2",
+    "gfpgan>=1.3.0",
+    "torch>=2.0.0",
+    "lpips>=0.1.4",  # perceptual LPIPS scoring for aggressive restores (facekeep quality --lpips)
+]
+# HEIC/HEIF input support.
+heic = [
+    "pillow-heif>=0.13.0",
+]
+# Optional MediaPipe BlazeFace detector backend (Tasks API). Haar/YuNet stay the
+# defaults; this is never a hard dependency.
+detect = [
+    "mediapipe>=0.10.9",
+]
+# Optional CodeFormer face-enhance backend for aggressive restore
+# (aggressive.face_enhance_backend: codeformer) — use together with [ai], which
+# provides facexlib/torch. NOTE: CodeFormer code + weights are S-Lab License 1.0
+# (NON-COMMERCIAL); installing this extra is the user accepting that license,
+# which is also why it is deliberately NOT mirrored into `all` below — a
+# non-commercial license must be an explicit opt-in, never implied by a
+# convenience bundle. GFPGAN stays the default backend.
+codeformer = [
+    "codeformer-pip>=0.0.4",
+]
+# Folder progress bar (optional; CLI degrades to no bar if absent).
+progress = [
+    "tqdm>=4.60.0",
+]
+# Local drag-and-drop web GUI (`facekeep gui`). Optional and deliberately NOT in
+# `all`: gradio pulls a whole web-server stack (FastAPI/uvicorn/...), which the
+# pipeline `all` bundle (AI/HEIC/MediaPipe/progress) has no reason to carry — a
+# GUI user installs [gui] explicitly. `facekeep gui` errors with an install hint
+# when it is absent, so the core/CLI install is unaffected (offline-first holds).
+gui = [
+    "gradio>=4.0.0",
+]
+# Convenience: every optional *runtime* feature at once (AI restore, HEIC input,
+# MediaPipe detector, progress bar). Excludes `dev` (test/lint tooling). Note it
+# still does NOT pull the external `avifenc` CLI — that is machine-local, not pip
+# (see the note above). Mirror new runtime extras here when adding them — except
+# license-gated ones ([codeformer], S-Lab non-commercial; see its note above).
+all = [
+    "realesrgan>=0.3.0",
+    "basicsr>=1.4.2",
+    "gfpgan>=1.3.0",
+    "torch>=2.0.0",
+    "lpips>=0.1.4",
+    "pillow-heif>=0.13.0",
+    "mediapipe>=0.10.9",
+    "tqdm>=4.60.0",
+]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1.0",
+    "tqdm>=4.60.0",
+    # Perceptual SSIMULACRA2 auto-tune metric / `facekeep quality --ssimulacra2`.
+    # Pure Python (numpy/scipy/pillow), no native binary or model download.
+    "ssimulacra2>=0.3.0",
+]
+
+[project.scripts]
+facekeep = "facekeep.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/wadeken/facekeep"
+Repository = "https://github.com/wadeken/facekeep"
+Issues = "https://github.com/wadeken/facekeep/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "facekeep.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["facekeep*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

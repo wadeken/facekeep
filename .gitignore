@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
+.venv/
+.venv-mediapipe/
+.venv-pkgtest/
+venv/
+
+# Test / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# FaceKeep outputs / caches
+*.fkeep
+*.avif
+*.jxl
+*.webp
+~/.cache/facekeep/
+compressed/
+outputs/
+test_run/
+_bench/
+gfpgan/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Claude Code local settings (machine-specific paths / personal permissions)
+.claude/
+
+# Reproducible sample image (regenerate with examples/make_sample.py)
+examples/sample_family.jpg
+
+# Models / weights
+*.onnx
+*.pth
+
+# Local external binaries (e.g. avifenc.exe for delta-Q ROI / 10-bit spikes)
+.tools/
+
+# Internal dev docs — kept on disk for the working copy, never published
+CLAUDE.md
+docs/CLAUDE_CODE_GUIDE.md
+docs/IMPROVEMENTS.md
+docs/PROMPTS.md
+docs/ROADMAP.md
