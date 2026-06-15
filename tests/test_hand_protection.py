@@ -38,9 +38,11 @@ import pytest
 
 import facekeep.aggressive.compressor as compressor_mod
 from facekeep.aggressive.compressor import (
+    _c1_hand_zones,
     _dedupe_regions,
     _hand_regions,
     _hand_zones_from_faces,
+    _merge_overlapping_boxes,
     compress_photo,
 )
 from facekeep.aggressive.format import (
@@ -197,6 +199,93 @@ def test_hand_regions_disabled_when_content_aware_off():
     cfg = AggressiveConfig(content_aware=False)
     img = np.zeros((1000, 1500, 3), np.uint8)
     assert _hand_regions(cfg, [_normal_face()], img, hand_detector=None) == []
+
+
+# --------------------------------------------------------------------------- #
+# B2. C1 over-coverage guard: merge overlapping bands + cap+bail on group photos
+#
+# On a dense group/family photo the per-face C1 bands stack up to cover a large
+# slice of the frame (mostly torsos/laps with no hands), bloating the .fkeep
+# larger than the source. The guard merges the redundant overlapping bands and
+# *drops C1 hand protection entirely* once coverage exceeds hand_zone_max_frac.
+# Only C1 (the geometric guess) is capped — C2 real detections are trusted.
+# --------------------------------------------------------------------------- #
+
+def _row_of_faces(n, *, w=1500, h=1000, fw=100, fh=120, top=300):
+    """``n`` evenly-spaced same-height faces across the frame (a group photo)."""
+    faces = []
+    for i in range(n):
+        cx = int((i + 0.5) * w / n)
+        x1 = cx - fw // 2
+        faces.append(_face(x1, top, x1 + fw, top + fh))
+    return faces
+
+
+def test_merge_unions_overlapping_boxes():
+    a = (100, 100, 300, 300)
+    b = (150, 150, 350, 350)        # overlaps a at IoU ~0.39 (> 0.2)
+    out = _merge_overlapping_boxes([a, b], 0.2)
+    assert out == [(100, 100, 350, 350)]  # one box bounding both
+
+
+def test_merge_leaves_slightly_overlapping_boxes_separate():
+    # IoU ~0.10 (below the 0.2 merge threshold) -> kept separate, not unioned.
+    a = (100, 100, 300, 300)
+    b = (250, 150, 450, 350)
+    assert _merge_overlapping_boxes([a, b], 0.2) == [a, b]
+
+
+def test_merge_keeps_disjoint_boxes():
+    a = (0, 0, 100, 100)
+    b = (900, 900, 1000, 1000)
+    assert _merge_overlapping_boxes([a, b], 0.2) == [a, b]
+
+
+def test_merge_empty():
+    assert _merge_overlapping_boxes([], 0.2) == []
+
+
+def test_c1_single_face_unchanged_by_guard():
+    """A lone face is well under the cap and has no overlapping bands → no change."""
+    cfg = AggressiveConfig()
+    raw = _hand_zones_from_faces([_normal_face()], 1500, 1000)
+    assert _c1_hand_zones(cfg, [_normal_face()], 1500, 1000) == raw
+    assert raw  # non-empty (a few-face photo keeps its hand protection)
+
+
+def test_c1_dense_group_bails_to_no_zones():
+    """A dense row of faces blows past the coverage cap → C1 hand zones dropped."""
+    faces = _row_of_faces(6)
+    raw = _hand_zones_from_faces(faces, 1500, 1000)
+    assert len(raw) > 6  # the un-guarded geometry emits many broad bands
+    cfg = AggressiveConfig(hand_zone_max_frac=0.10)  # explicit low cap
+    assert _c1_hand_zones(cfg, faces, 1500, 1000) == []
+
+
+def test_c1_bail_is_the_cap_not_the_geometry():
+    """The same dense group survives once the cap is lifted (the bail is the cap)."""
+    faces = _row_of_faces(6)
+    permissive = AggressiveConfig(hand_zone_max_frac=1.0)
+    kept = _c1_hand_zones(permissive, faces, 1500, 1000)
+    assert kept  # with no real cap the zones survive (merged), proving the bail
+    assert sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in kept) > 0
+
+
+def test_hand_regions_c1_group_photo_bails():
+    """The tier selector routes C1 through the guard → group photo gets no zones."""
+    cfg = AggressiveConfig(hand_zone_max_frac=0.10)
+    img = np.zeros((1000, 1500, 3), np.uint8)
+    assert _hand_regions(cfg, _row_of_faces(6), img, hand_detector=None) == []
+
+
+def test_c2_detections_never_capped():
+    """Real C2 boxes covering most of the frame are NOT subject to the C1 cap."""
+    cfg = AggressiveConfig()
+    img = np.zeros((1000, 1500, 3), np.uint8)
+    # Huge boxes (well over hand_zone_max_frac of the frame) — trusted as-is.
+    big = [(0, 0, 700, 900), (800, 0, 1500, 900)]
+    fake = _FakeHandDetector(big)
+    assert _hand_regions(cfg, _row_of_faces(6), img, hand_detector=fake) == big
 
 
 # --------------------------------------------------------------------------- #
@@ -405,18 +494,28 @@ def test_validate_rejects_bad_hand_zone_scale():
             cfg.validate()
 
 
+def test_validate_rejects_bad_hand_zone_max_frac():
+    for bad in (0.0, -0.1, 1.5):
+        cfg = FaceKeepConfig()
+        cfg.aggressive.hand_zone_max_frac = bad
+        with pytest.raises(ConfigError, match="hand_zone_max_frac"):
+            cfg.validate()
+
+
 def test_yaml_roundtrip_hand_fields(tmp_path):
     cfg = FaceKeepConfig()
     cfg.mode = "aggressive"
     cfg.aggressive.protect_hands = False
     cfg.aggressive.protect_hands_backend = "mediapipe"
     cfg.aggressive.hand_zone_scale = 0.75
+    cfg.aggressive.hand_zone_max_frac = 0.4
     p = tmp_path / "c.yaml"
     cfg.save(p)
     loaded = FaceKeepConfig.load(p)
     assert loaded.aggressive.protect_hands is False
     assert loaded.aggressive.protect_hands_backend == "mediapipe"
     assert loaded.aggressive.hand_zone_scale == 0.75
+    assert loaded.aggressive.hand_zone_max_frac == 0.4
 
 
 def test_fingerprint_busts_on_hand_fields():
@@ -428,6 +527,7 @@ def test_fingerprint_busts_on_hand_fields():
         ("protect_hands", False),
         ("protect_hands_backend", "mediapipe"),
         ("hand_zone_scale", 0.5),
+        ("hand_zone_max_frac", 0.5),
     ):
         cfg = FaceKeepConfig()
         cfg.mode = "aggressive"

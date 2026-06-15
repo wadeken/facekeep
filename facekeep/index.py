@@ -131,6 +131,7 @@ def settings_fingerprint(config: FaceKeepConfig) -> str:
             "protect_hands": config.aggressive.protect_hands,
             "protect_hands_backend": config.aggressive.protect_hands_backend,
             "hand_zone_scale": config.aggressive.hand_zone_scale,
+            "hand_zone_max_frac": config.aggressive.hand_zone_max_frac,
             # C2 detection tuning changes which hands are found (and thus which
             # region patches are emitted), so it is output-affecting too.
             "hand_detect_confidence": config.aggressive.hand_detect_confidence,

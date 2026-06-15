@@ -207,6 +207,17 @@ class AggressiveConfig:
     protect_hands: bool = True  # keep hands sharp via region patches (default C1)
     protect_hands_backend: Optional[str] = None  # None -> C1 geometry; "mediapipe" -> C2
     hand_zone_scale: float = 1.0  # resolution to store hand patches at (1.0 = orig)
+    # C1 over-coverage guard (no effect on C2 real detection). The C1 geometric
+    # hand zones are a body-proportion *guess*; on a dense group/family photo each
+    # face's bands stack up to cover a large slice of the frame (mostly torsos/laps
+    # with no hands), which encodes to most of the .fkeep and destroys the ratio.
+    # So the merged C1 zones are dropped entirely when their union covers more than
+    # this fraction of the frame — the photo still compresses via the face crops +
+    # whole-image conservatism, and a user who needs real group-hand protection
+    # opts into C2. Mirrors aggressive.text_region_max_frac. Tuned on the corpus:
+    # a dense 5-face group covers ~43% (its .fkeep was *larger* than the source) →
+    # bails; a 3-face photo covers ~22% → kept (C1 still useful there).
+    hand_zone_max_frac: float = 0.30  # drop C1 hand zones above this frame coverage
     # C2 (MediaPipe) detection tuning — recall knobs (no effect on C1). MediaPipe's
     # palm detector is trained for phone-camera-sized frames, so on a big photo
     # (e.g. 12 MP) a hand is a tiny fraction of the frame and is missed. So C2
@@ -765,6 +776,10 @@ class FaceKeepConfig:
         if not 0 < self.aggressive.hand_zone_scale <= 1.0:
             raise ConfigError(
                 "aggressive.hand_zone_scale must be between 0 (exclusive) and 1.0"
+            )
+        if not 0 < self.aggressive.hand_zone_max_frac <= 1.0:
+            raise ConfigError(
+                "aggressive.hand_zone_max_frac must be between 0 (exclusive) and 1.0"
             )
         if not 0 <= self.aggressive.hand_detect_confidence <= 1:
             raise ConfigError(

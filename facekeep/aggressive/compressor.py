@@ -14,6 +14,7 @@ from ..config import AggressiveConfig, FaceKeepConfig
 from ..detector import (
     DetectionCache,
     FaceRegion,
+    _iou,
     create_detector,
     detect_cached,
 )
@@ -252,6 +253,7 @@ _HAND_ZONE_DOWN_NEAR = 1.0   # band starts ~1 face-height below the face
 _HAND_ZONE_DOWN_FAR = 3.0    # band ends ~3 face-heights below the face
 _HAND_ZONE_INNER = 0.6       # inner edge of each side band (face-widths from centre)
 _HAND_ZONE_OUTER = 2.2       # outer edge of each side band (face-widths from centre)
+_HAND_ZONE_MERGE_IOU = 0.2   # union C1 bands overlapping at least this much into one
 
 
 def _hand_zones_from_faces(
@@ -293,6 +295,75 @@ def _hand_zones_from_faces(
     return zones
 
 
+def _merge_overlapping_boxes(
+    boxes: List[Tuple[int, int, int, int]], iou_thresh: float
+) -> List[Tuple[int, int, int, int]]:
+    """Union boxes overlapping at >= ``iou_thresh`` into their bounding box.
+
+    A fixed-point merge: any two boxes that overlap enough are replaced by the
+    single box bounding both, repeated until nothing more merges. Unlike NMS (which
+    *drops* the smaller of an overlapping pair) this keeps the covered area while
+    collapsing the redundant, overlapping bands the C1 hand-zone geometry emits for
+    adjacent faces — so the same pixels aren't stored in several patches. Pure.
+    """
+    boxes = list(boxes)
+    changed = True
+    while changed:
+        changed = False
+        out: List[Tuple[int, int, int, int]] = []
+        for b in boxes:
+            for i, o in enumerate(out):
+                if _iou(b, o) >= iou_thresh:
+                    out[i] = (min(b[0], o[0]), min(b[1], o[1]),
+                              max(b[2], o[2]), max(b[3], o[3]))
+                    changed = True
+                    break
+            else:
+                out.append(b)
+        boxes = out
+    return boxes
+
+
+def _c1_hand_zones(
+    cfg: AggressiveConfig, faces: List[FaceRegion], img_w: int, img_h: int
+) -> List[Tuple[int, int, int, int]]:
+    """C1 geometric hand zones, merged and coverage-capped.
+
+    Post-processes the raw per-face bands (``_hand_zones_from_faces``) so the
+    offline guess doesn't wreck the ratio on a dense group/family photo:
+
+    1. **Merge** mutually-overlapping bands (adjacent faces produce redundant,
+       overlapping bands) so the same pixels aren't stored in several patches.
+    2. **Cap + bail** — the bands are a body-proportion *guess*, and when they
+       cover more than ``cfg.hand_zone_max_frac`` of the frame (a people-dense
+       photo) most of that is torso/lap with no hands; storing it near-original
+       destroys the ratio, so drop C1 hand protection entirely (the photo still
+       compresses via the face crops + whole-image conservatism, and a user who
+       needs real group-hand protection opts into C2). Mirrors the text-region
+       ``text_region_max_frac`` guard.
+
+    Only the C1 path is capped — C2 (real detection) boxes are tight and trusted.
+    Pure (no I/O, no mutation).
+    """
+    zones = _hand_zones_from_faces(faces, img_w, img_h)
+    if not zones:
+        return []
+    zones = _merge_overlapping_boxes(zones, _HAND_ZONE_MERGE_IOU)
+    frame = float(img_w * img_h)
+    if frame > 0:
+        # Approximate union (merged boxes are largely disjoint; any residual
+        # sub-threshold overlap only over-counts, erring toward the safe bail).
+        coverage = sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in zones) / frame
+        if coverage > cfg.hand_zone_max_frac:
+            logger.info(
+                "C1 hand zones cover ~%.0f%% of the frame (> %.0f%% cap) — dropping "
+                "them (dense group photo; compresses without C1 hand protection)",
+                100 * coverage, 100 * cfg.hand_zone_max_frac,
+            )
+            return []
+    return zones
+
+
 def _hand_regions(
     cfg: AggressiveConfig,
     faces: List[FaceRegion],
@@ -304,10 +375,12 @@ def _hand_regions(
     Gated by ``content_aware and region_local and protect_hands`` (hands are a
     region-local protection, so they ride the same switches as small-face regions).
     When a ``hand_detector`` is present (C2, opt-in MediaPipe) its tight per-hand
-    boxes are used; if it finds none, fall back to the offline C1 geometry so an
-    opt-in run with a quiet detector still gets the safe guess. With no detector
-    (the default), use C1 geometry directly. Returns an empty list when disabled.
-    Pure apart from the (best-effort, read-only) hand detector call.
+    boxes are used as-is (trusted real detections, never capped); if it finds none,
+    fall back to the offline C1 geometry so an opt-in run with a quiet detector
+    still gets the safe guess. With no detector (the default), use C1 geometry. The
+    C1 zones are merged and coverage-capped (``_c1_hand_zones``) so the offline
+    guess doesn't wreck the ratio on a dense group photo. Returns an empty list
+    when disabled. Pure apart from the (best-effort, read-only) hand detector call.
     """
     if not (cfg.content_aware and cfg.region_local and cfg.protect_hands):
         return []
@@ -317,7 +390,7 @@ def _hand_regions(
             return boxes
         # Detector ran but found nothing — fall through to the geometric guess.
     h, w = image.shape[:2]
-    return _hand_zones_from_faces(faces, w, h)
+    return _c1_hand_zones(cfg, faces, w, h)
 
 
 def _dedupe_regions(

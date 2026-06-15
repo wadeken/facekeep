@@ -254,7 +254,16 @@ Haar-default / YuNet-opt-in detector split:
   each detected face from body proportions (`_hand_zones_from_faces`; the torso
   centre is deliberately excluded so only the *hands* are protected, not the whole
   upper body — far less compression cost than `roi: person`). A probabilistic
-  guess: overhead/off-body/face-less hands are missed.
+  guess: overhead/off-body/face-less hands are missed. Because it is a *guess*, a
+  dense group/family photo stacks one guess per face until they cover a large
+  slice of the frame (mostly torsos/laps with no hands) — a 5-face group once made
+  a `.fkeep` *larger than the source*. So C1 zones are post-processed
+  (`_c1_hand_zones`): overlapping bands are **merged** (so adjacent faces don't
+  store the same pixels twice), and the whole set is **dropped** once its coverage
+  exceeds `aggressive.hand_zone_max_frac` (default 0.30, corpus-tuned: a ~43%
+  5-face group bails to no C1 protection — it still compresses via the face crops
+  + whole-image conservatism — while a ~22% 3-face photo is kept). This guard is
+  C1-only; C2's tight real detections are never capped.
 - **C2 (opt-in upgrade):** real MediaPipe Hand Landmarker detection
   (`detector.HandDetector`, `[detect]` extra, model via `models.ensure_weights`)
   gives tight per-hand boxes and catches off-body hands. Because MediaPipe's palm
@@ -277,9 +286,9 @@ Haar-default / YuNet-opt-in detector split:
 
 Hand detection is parent-process-only (the landmarker isn't picklable), so
 `--jobs` workers use C1 — the same discipline as the detection cache. The new
-fields (`protect_hands`, `protect_hands_backend`, `hand_zone_scale`, and the C2
-tuning knobs `hand_detect_*`) feed `settings_fingerprint`; the C1 geometry factors
-are module constants. **Honest limitation:** the C1 default is a body-proportion
+fields (`protect_hands`, `protect_hands_backend`, `hand_zone_scale`,
+`hand_zone_max_frac`, and the C2 tuning knobs `hand_detect_*`) feed
+`settings_fingerprint`; the C1 geometry/merge factors are module constants. **Honest limitation:** the C1 default is a body-proportion
 *guess*, not detection — for precise off-body hands a user opts into C2.
 
 **Quality-targeted `bg_scale`** is the opt-in alternative to a single fixed
