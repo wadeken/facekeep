@@ -135,6 +135,11 @@ pip install "facekeep[heic]"         # + HEIC/HEIF input
 pip install "facekeep[gui]"          # + local drag-and-drop web GUI
 ```
 
+> **iPhone HEIC/HEIF?** Add the `[heic]` extra above. Without it, `.heic`/`.heif`
+> inputs are skipped with a one-line install hint (your other photos still
+> process). HEIC is already an efficient format, so it shrinks most in
+> **aggressive** mode (`-m aggressive`) — a faithful re-encode saves only a little.
+
 ### Docker
 
 For reproducible batch runs without installing anything on the host:

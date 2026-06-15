@@ -8,6 +8,7 @@ step).
 """
 
 import copy
+import importlib.util
 import logging
 import multiprocessing
 import os
@@ -26,10 +27,44 @@ from .config import (
     preset_restore_overrides,
 )
 from .detector import DetectionCache
-from .exceptions import ConfigError, FaceKeepError, SkipFileError
+from .exceptions import (
+    ConfigError,
+    FaceKeepError,
+    SkipFileError,
+    UnsupportedInputError,
+)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff",
               ".heic", ".heif"}
+
+# HEIC/HEIF (the default capture format on every recent iPhone) decodes only with
+# the optional [heic] extra (pillow-heif). When it isn't installed we want a
+# friendly, actionable hint rather than a raw "requires an extra plugin" failure
+# — see the UnsupportedInputError branch in _process_one.
+_HEIC_EXTS = {".heic", ".heif"}
+
+
+def _heic_plugin_available() -> bool:
+    """True if the optional HEIC reader (pillow-heif, the ``[heic]`` extra) imports.
+
+    Cheap and side-effect-free (``find_spec`` only). Used to tell a *missing-plugin*
+    HEIC input apart from a genuinely unreadable one: a corrupt HEIC *with* the
+    plugin present is still a real failure, not a friendly skip.
+    """
+    try:
+        return importlib.util.find_spec("pillow_heif") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _heic_install_hint() -> str:
+    """Actionable one-liner shown when a HEIC/HEIF input needs the ``[heic]`` extra.
+
+    ASCII-only on purpose: this prints to the terminal, and a non-ASCII dash
+    renders as mojibake on a legacy Windows code page (e.g. cp950).
+    """
+    return ('HEIC/HEIF support needs the optional reader. Install it with: '
+            'pip install "facekeep[heic]"')
 
 
 def _setup_logging(verbose: bool):
@@ -279,6 +314,15 @@ def _process_one(file_str: str, target: str, config: FaceKeepConfig,
             )
     except SkipFileError as e:
         result.update(status="skipped", error=str(e))
+    except UnsupportedInputError as e:
+        # A HEIC/HEIF input without the [heic] extra is a friendly skip with an
+        # actionable hint, not a scary FAILED — it isn't the user's fault and the
+        # file isn't corrupt. Any *other* unsupported input — including a corrupt
+        # HEIC with the plugin installed — stays a real failure (don't mask bugs).
+        if f.suffix.lower() in _HEIC_EXTS and not _heic_plugin_available():
+            result.update(status="skipped", error=_heic_install_hint())
+        else:
+            result.update(status="failed", error=str(e))
     except FaceKeepError as e:
         result.update(status="failed", error=str(e))
     except Exception as e:  # noqa: BLE001 - isolate unexpected per-file failures
@@ -480,6 +524,9 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     aggressive mode (-m aggressive, or just pick a --preset, which implies it):
     faces/hands/detail are kept sharp, the benign background is rebuilt on
     restore, and the output is a .fkeep you bring back with `facekeep restore`.
+
+    HEIC/HEIF input (e.g. iPhone photos) needs the optional [heic] extra
+    (pip install "facekeep[heic]"); without it those files are skipped with a hint.
     """
     _setup_logging(verbose)
     try:
