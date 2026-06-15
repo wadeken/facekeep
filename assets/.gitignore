@@ -1,0 +1,9 @@
+# assets/ holds PRIVATE test photos (including a photo of a real child) and
+# scratch AI generations. NONE of these may ever be committed/published.
+# Only the curated, public-safe promotional images explicitly un-ignored below
+# are allowed into git. This is a deliberate privacy safeguard — do not weaken
+# it by switching to a blocklist. Add new public images with another `!` line.
+*
+!.gitignore
+!hero.png
+!proof.png

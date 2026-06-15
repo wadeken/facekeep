@@ -1,5 +1,11 @@
 # FaceKeep
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/wadeken/facekeep/main/assets/hero.png"
+       alt="FaceKeep — face-aware photo compression: shrink a photo library 8–12× while keeping every face pixel-perfect"
+       width="100%">
+</p>
+
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -10,7 +16,8 @@ FaceKeep compresses a photo library *hard* by spending bytes only where your eye
 goes. Its headline **aggressive mode** keeps every **face — plus hands, fine
 detail, and (opt-in) signage — at original quality**, downsamples only the benign
 background (sky, foliage, plain walls), and reconstructs that background on
-restore. You get roughly **8–12× smaller** than JPEG with the people still sharp.
+restore. You get roughly **8–12× smaller** than JPEG — **up to ~40×** on photos
+that are mostly scenery — with the people still sharp.
 
 Naive "AI shrink" tools downsample the *whole* photo and hallucinate it back —
 faces included, which come back uncanny. FaceKeep won't: faces are detected and
@@ -19,6 +26,25 @@ not the original*, FaceKeep is honest about the trade — aggressive output is a
 `.fkeep` you bring back with one `restore` command, and when you want **every
 pixel real in a file that opens anywhere**, the **faithful default mode** does
 exactly that.
+
+## See it work
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/wadeken/facekeep/main/assets/proof.png"
+       alt="FaceKeep before/after: a 10.5 MB family photo compressed to 260 KB (41× smaller) with every face kept pixel-perfect"
+       width="100%">
+</p>
+
+A real 17-megapixel family photo in aggressive mode: **10.5 MB → 260 KB (41×
+smaller)**. The three faces are stored as original-quality crops — **byte-for-byte
+identical, not reconstructed** (see the zoom strip) — while only the benign
+background (sky, mountains, lake, foliage) is downsampled and rebuilt on restore.
+Restored above with real Real-ESRGAN: smooth content is indistinguishable and
+fine detail holds up under a 100% zoom.
+
+> **41× is a scenic, few-face best case** — people-heavy photos land nearer the
+> typical 8–12×. And the background is *plausible, not the original*: that's the
+> aggressive-mode trade. Need every pixel real? The faithful default keeps them.
 
 ## Two modes
 
@@ -30,7 +56,7 @@ exactly that.
 | Restore step | `facekeep restore` | None — just open it |
 | Background | Reconstructed (plausible) | Real pixels, efficiently coded |
 | Fidelity | The people are real; background is plausible | Visually lossless (SSIM > 0.98) |
-| Typical ratio | ~8–12× vs JPEG | ~2.5–3× vs JPEG |
+| Typical ratio | ~8–12× vs JPEG (up to ~40×) | ~2.5–3× vs JPEG |
 | Opens anywhere | Needs `facekeep restore` | ✅ |
 | Needs AI / torch | Yes, for the best restore (bicubic without) | No |
 
