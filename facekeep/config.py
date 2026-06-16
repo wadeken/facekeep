@@ -142,6 +142,23 @@ class AggressiveConfig:
     # still forces lossless PNG regardless of this. jpg is the universal default.
     face_codec: str = "jpg"  # jpg | avif | jxl
 
+    # Output bit depth for the real-pixel members (face crops + region patches).
+    # 8 (default) = the 8-bit container: a high-bit source (e.g. a 10/12-bit HDR
+    # HEIC, decoded as uint16) is rounded down to 8-bit like every other member.
+    # 10 | 12 = store crops/regions at true high bit depth via the external
+    # `avifenc` CLI, so iPhone-style HDR survives the round-trip. The background,
+    # thumbnail, and residual stay 8-bit (the background is hallucinated on
+    # restore, so high-bit there buys nothing — the win is the real-pixel crops).
+    # High-bit storage ENGAGES only when output_bit_depth in (10, 12) AND
+    # face_codec == "avif" AND avifenc/avifdec are locatable; otherwise it degrades
+    # gracefully to the warned 8-bit round-down (offline-first holds, and the
+    # default 8 is byte-identical). It makes the .fkeep larger (HDR crops exceed
+    # 8-bit) — the explicit fidelity/ratio trade — so it is off by default.
+    # Output-affecting -> in index.settings_fingerprint. Restoring a high-bit
+    # .fkeep to true HDR needs an avif/jxl output (`restore -f avif`); a JPEG
+    # output rounds down (warned).
+    output_bit_depth: int = 8  # 8 (off) | 10 | 12 — high-bit crops via avifenc
+
     # Detection override (aggressive mode only). The worst failure here is a
     # small/distant background face that detection *missed*: it gets downsampled
     # and the AI reconstructs it into something uncanny — emotionally worse than
@@ -638,6 +655,10 @@ aggressive:
   bg_codec: {a.bg_codec}        # jpg (default) | avif | jxl (4:2:0; cleaner SR input)
   face_quality: {a.face_quality}       # face-crop quality (>=100 -> lossless PNG)
   face_codec: {a.face_codec}        # jpg (default) | avif | jxl (4:4:4)
+  # Store face/region crops at true high bit depth (10 | 12) so HDR sources
+  # (e.g. iPhone HDR HEIC) survive — needs face_codec: avif + the avifenc CLI.
+  # 8 = 8-bit container (default; background/residual stay 8-bit). Larger .fkeep.
+  output_bit_depth: {a.output_bit_depth}
   content_aware: {str(a.content_aware).lower()}   # keep text/fine-detail/small-face regions sharp
   protect_hands: {str(a.protect_hands).lower()}   # keep hands sharp (region patches)
   # Opt-in: also patch localized text-like clusters (signage) so the AI never
@@ -723,6 +744,11 @@ class FaceKeepConfig:
         if self.aggressive.bg_codec not in ("jpg", "avif", "jxl"):
             raise ConfigError(
                 f"Unknown aggressive.bg_codec: {self.aggressive.bg_codec!r}"
+            )
+        if self.aggressive.output_bit_depth not in (8, 10, 12):
+            raise ConfigError(
+                "aggressive.output_bit_depth must be 8 (8-bit container), 10, or 12 "
+                "(high-bit crops via the avifenc CLI; needs face_codec='avif')"
             )
         # None (inherit) or any built-in/registered custom backend (same hook as
         # the shared detector.backend above), so a plugin can also be the

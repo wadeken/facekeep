@@ -746,11 +746,33 @@ def compress_photo(
             logger.info("Quality-targeted (%s) in %s; using bg_scale=%.3f",
                         q_reason, path.name, effective_bg_scale)
 
+    # Resolve the pixel source for each stored member. The .fkeep is an 8-bit
+    # container by default, so a high-bit source (e.g. a 10/12-bit HDR HEIC ->
+    # uint16) is rounded down with the clean /257 _to_uint8 (NOT OpenCV's CV_8U
+    # imencode fallback, which is not a clean down-convert). When high-bit crop
+    # storage is requested (output_bit_depth 10/12 + AVIF crop codec), the
+    # *real-pixel* members (face + region crops) keep their uint16 depth so
+    # iPhone-style HDR survives; the background, thumbnail and residual stay 8-bit
+    # (the background is hallucinated on restore, so high-bit there buys nothing).
+    # The encode layer (format._encode_crop) degrades to 8-bit + warns when
+    # avifenc is unavailable, so high-bit storage is best-effort. An 8-bit source
+    # makes both `is image`, so the default path is byte-identical. Detection
+    # above ran on the full-depth `image` regardless.
+    high_bit = cfg.output_bit_depth in (10, 12) and cfg.face_codec == "avif"
+    bg_pixels = _to_uint8(image)
+    crop_pixels = image if high_bit else bg_pixels
+    if image.dtype != np.uint8 and not high_bit:
+        logger.warning(
+            "%s is %s (high-bit); the .fkeep is an 8-bit container, so it is "
+            "rounded down to 8-bit. Faithful mode preserves 10/12-bit HDR.",
+            path.name, image.dtype,
+        )
+
     # Extract face crops at original quality + build blending masks
     face_crops, face_masks = [], []
     for face in faces:
         px1, py1, px2, py2 = face.padded_bbox
-        face_crops.append(image[py1:py2, px1:px2].copy())
+        face_crops.append(crop_pixels[py1:py2, px1:px2].copy())
         margin = max(8, min(32, (px2 - px1) // 8))
         face_masks.append(create_soft_mask((py2 - py1, px2 - px1), margin=margin))
 
@@ -771,7 +793,7 @@ def compress_photo(
     regions = small_face_regions + hand_regions + text_regions
     region_crops, region_masks = [], []
     for (rx1, ry1, rx2, ry2), rscale in zip(regions, region_scales):
-        patch = image[ry1:ry2, rx1:rx2]
+        patch = crop_pixels[ry1:ry2, rx1:rx2]
         if rscale < 1.0:
             pw = max(1, int((rx2 - rx1) * rscale))
             ph = max(1, int((ry2 - ry1) * rscale))
@@ -792,12 +814,12 @@ def compress_photo(
     # Downsample background
     new_w = max(1, int(w * effective_bg_scale))
     new_h = max(1, int(h * effective_bg_scale))
-    background = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    background = cv2.resize(bg_pixels, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
     # Thumbnail
     thumb_h = 256
     thumb_w = max(1, int(w * (thumb_h / h)))
-    thumbnail = cv2.resize(image, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+    thumbnail = cv2.resize(bg_pixels, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
 
     return CompressedPhoto(
         original_filename=path.name,
@@ -818,8 +840,10 @@ def compress_photo(
         region_crops=region_crops,
         region_masks=region_masks,
         regions=regions,
-        # The .fkeep is an 8-bit container, so the residual is computed against
-        # the 8-bit rendering of the source (a uint16 source rides the same
-        # warned-elsewhere round-down as the background itself).
-        original_image=_to_uint8(image) if cfg.residual else None,
+        # The residual stays 8-bit (the .fkeep residual member is 8-bit): compute
+        # it against the *same* 8-bit ``bg_pixels`` the background was built from
+        # (clean /257 round-down for a uint16 source, ``is image`` for an 8-bit
+        # one), so the residual and the background it corrects agree on the
+        # down-convert.
+        original_image=bg_pixels if cfg.residual else None,
     )

@@ -227,11 +227,11 @@ def test_default_codec_is_jpg_and_unchanged(tmp_path):
     name, _ = _crop_member_and_bytes(fkeep)
     assert name == "face_000.jpg"
     # Manifest still records the codec (default jpg). Schema version is the
-    # current one (1.7.0, latest bump for the preset key); the default
-    # jpg-crop behavior is unchanged regardless.
+    # current one (1.8.0, latest bump for the high-bit bit_depth key); the
+    # default jpg-crop behavior is unchanged regardless.
     info = read_fkeep_info(str(fkeep))
     assert info["settings"]["face_codec"] == "jpg"
-    assert info["version"] == "1.7.0"
+    assert info["version"] == "1.8.0"
 
 
 def test_default_fkeep_verifies_clean(face_image, tmp_path):

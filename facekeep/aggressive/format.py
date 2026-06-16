@@ -35,7 +35,7 @@ import numpy as np
 
 from .. import __version__
 from ..exceptions import EncodingError, FormatError
-from .compressor import CompressedPhoto
+from .compressor import CompressedPhoto, _to_uint8
 
 logger = logging.getLogger("facekeep.aggressive.format")
 
@@ -205,29 +205,55 @@ def _read_residual(zf: zipfile.ZipFile, names: set) -> Optional[np.ndarray]:
     return None
 
 
-def _encode_crop(crop: np.ndarray, cfg) -> Tuple[str, bytes]:
-    """Encode one face crop, returning (extension, bytes).
+def _encode_crop(crop: np.ndarray, cfg) -> Tuple[str, bytes, int]:
+    """Encode one face/region crop, returning (extension, bytes, stored_bit_depth).
 
-    ``face_quality >= 100`` always wins as lossless PNG (the explicit lossless
-    request, independent of codec). Otherwise the crop uses ``cfg.face_codec``:
-    avif/jxl are stored 4:4:4 (faces -> keep skin/lip color crisp) at
-    ``face_quality``, and jpg (the default) stays JPEG at ``face_quality``.
+    A **uint16** crop reaches here only when high-bit storage was requested
+    (``output_bit_depth`` 10/12 + ``face_codec == 'avif'`` + ``face_quality < 100``;
+    the compressor keeps such crops uint16). It is stored as a true high-bit AVIF
+    (``encode_highbit_avif``, 4:4:4) so HDR survives, and ``stored_bit_depth`` is
+    that depth. If avifenc is unavailable (or the encode fails) the crop is cleanly
+    down-converted to 8-bit and stored as usual with ``stored_bit_depth`` 8 —
+    graceful degradation, so high-bit is best-effort and offline-first holds.
+
+    An 8-bit crop takes the existing path unchanged: ``face_quality >= 100`` wins as
+    lossless PNG; otherwise ``cfg.face_codec`` (avif/jxl stored 4:4:4, else JPEG).
+    ``stored_bit_depth`` is 8 in every 8-bit case.
     """
-    if cfg.face_quality >= 100:
-        return "png", _png(crop)
-    if cfg.face_codec in ("avif", "jxl"):
-        from .. import encoders
+    from .. import encoders
 
+    if crop.dtype == np.uint16:
+        if encoders.avifenc_available():
+            try:
+                data = encoders.encode_highbit_avif(
+                    crop, bit_depth=cfg.output_bit_depth,
+                    quality=cfg.face_quality, chroma="444", has_faces=True,
+                )
+                return "avif", data, cfg.output_bit_depth
+            except encoders.EncodingError as e:
+                logger.warning("High-bit crop encode failed (%s); storing it 8-bit.", e)
+        else:
+            logger.warning(
+                "output_bit_depth=%d requested but avifenc is unavailable; storing "
+                "crops 8-bit (install avifenc / set FACEKEEP_AVIFENC to keep HDR).",
+                cfg.output_bit_depth,
+            )
+        crop = _to_uint8(crop)  # clean /257 down-convert for the 8-bit path below
+
+    if cfg.face_quality >= 100:
+        return "png", _png(crop), 8
+    if cfg.face_codec in ("avif", "jxl"):
         data = encoders.encode(
             crop, codec=cfg.face_codec, quality=cfg.face_quality,
             chroma="444", has_faces=True,
         )
-        return cfg.face_codec, data
-    return "jpg", _jpg(crop, cfg.face_quality)
+        return cfg.face_codec, data, 8
+    return "jpg", _jpg(crop, cfg.face_quality), 8
 
 
 def _read_crop(
-    zf: zipfile.ZipFile, names: set, i: int, prefix: str = "face"
+    zf: zipfile.ZipFile, names: set, i: int, prefix: str = "face",
+    high_bit: bool = False,
 ) -> Optional[np.ndarray]:
     """Decode crop ``i`` (``<prefix>_NNN.*``) from an open archive, or None.
 
@@ -238,6 +264,12 @@ def _read_crop(
     (Pillow -> BGR, since cv2 can't decode them here), png/jpg through cv2.
     Returns a BGR array (matching the other crops/background) or None when the
     crop is absent — the caller decides whether absence is an error.
+
+    ``high_bit`` (set by ``read_fkeep`` from the manifest's ``settings.bit_depth``)
+    decodes an AVIF crop at true 10/12-bit depth via the ``avifdec`` CLI
+    (``encoders.decode_highbit_avif`` -> uint16 BGR), so HDR survives restore. If
+    ``avifdec`` is unavailable it falls back to the 8-bit Pillow decode (warned) —
+    graceful degradation, offline-first.
     """
     for ext in _CROP_EXTS:
         member = f"{prefix}_{i:03d}.{ext}"
@@ -247,6 +279,14 @@ def _read_crop(
         if ext in ("avif", "jxl"):
             from .. import encoders
 
+            if high_bit and ext == "avif":
+                try:
+                    return encoders.decode_highbit_avif(raw)
+                except EncodingError as e:
+                    logger.warning(
+                        "High-bit crop decode failed (%s); falling back to 8-bit "
+                        "(install avifdec / set FACEKEEP_AVIFENC for full HDR).", e
+                    )
             return encoders.decode(raw)
         return _decode(raw)
     return None
@@ -326,13 +366,17 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
     thumb_bytes = _jpg(photo.thumbnail, 80)
     # Faces use high-quality JPEG by default (visually lossless, ~10x smaller
     # than PNG for photographic content). Optionally AVIF/JXL 4:4:4 (~2x smaller
-    # again, same perceptual quality), or lossless PNG when face_quality >= 100.
-    # See _encode_crop for the precedence.
-    face_payloads = [_encode_crop(crop, cfg) for crop in photo.face_crops]
+    # again, same perceptual quality), lossless PNG when face_quality >= 100, or
+    # true high-bit (10/12-bit) AVIF when output_bit_depth + face_codec allow it.
+    # _encode_crop returns (ext, bytes, stored_bit_depth); regions are just
+    # non-face crops, encoded identically. Strip the depth for the writer and take
+    # the max across all crops/regions as the container's stored real-pixel depth.
+    face_enc = [_encode_crop(crop, cfg) for crop in photo.face_crops]
+    region_enc = [_encode_crop(crop, cfg) for crop in photo.region_crops]
+    face_payloads = [(ext, data) for ext, data, _ in face_enc]
+    region_payloads = [(ext, data) for ext, data, _ in region_enc]
+    stored_bit_depth = max((d for _, _, d in face_enc + region_enc), default=8)
     mask_payloads = [_mask_png(m) for m in photo.face_masks]
-    # Region-local conservatism patches use the same crop codec/precedence as
-    # faces (avif/jxl 4:4:4, or lossless PNG when face_quality >= 100, else JPEG).
-    region_payloads = [_encode_crop(crop, cfg) for crop in photo.region_crops]
     region_mask_payloads = [_mask_png(m) for m in photo.region_masks]
     # Residual layer (opt-in): needs both the flag and the attached original
     # (compress_photo gates the latter on the former). Encoded here, in the
@@ -353,10 +397,10 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
     )
 
     manifest = {
-        # 1.7.0 added the optional settings.preset key (see below); 1.6.0 the
-        # residual layer. Readers are tolerant by structure, so older readers
-        # restore 1.7.0 files unchanged.
-        "version": "1.7.0",
+        # 1.8.0 added the optional settings.bit_depth key (high-bit crops); 1.7.0
+        # the optional settings.preset key; 1.6.0 the residual layer. Readers are
+        # tolerant by structure, so older readers restore 1.8.0 files unchanged.
+        "version": "1.8.0",
         "mode": "aggressive",
         "original": {
             "filename": photo.original_filename,
@@ -433,6 +477,13 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
     if cfg.preset is not None:
         manifest["settings"]["preset"] = cfg.preset
 
+    # Bit depth of the stored real-pixel members (manifest 1.8.0+): present only
+    # when crops/regions went high-bit (10/12-bit AVIF), so an 8-bit container
+    # carries no new key and packs byte-identically to a 1.7.0 file. read_fkeep
+    # uses it to decode those AVIF crops at full depth via avifdec.
+    if stored_bit_depth > 8:
+        manifest["settings"]["bit_depth"] = stored_bit_depth
+
     if dry_run:
         # Pack into memory to measure the real archive size; write nothing.
         buf = io.BytesIO()
@@ -465,9 +516,15 @@ def read_fkeep(fkeep_path: str) -> dict:
             exif = zf.read("exif.bin") if "exif.bin" in names else None
             icc = zf.read("icc.bin") if "icc.bin" in names else None
 
+            # High-bit crops (manifest 1.8.0+, settings.bit_depth 10/12) decode at
+            # full depth via avifdec; older/8-bit files have no key -> 8 -> False,
+            # so they read exactly as before.
+            settings = manifest.get("settings", {}) or {}
+            high_bit = int(settings.get("bit_depth", 8) or 8) > 8
+
             face_crops, face_masks = [], []
             for i in range(len(manifest["faces"])):
-                crop = _read_crop(zf, names, i)
+                crop = _read_crop(zf, names, i, high_bit=high_bit)
                 if crop is None:
                     raise KeyError(f"face_{i:03d}.(png|avif|jxl|jpg)")
                 face_crops.append(crop)
@@ -477,7 +534,7 @@ def read_fkeep(fkeep_path: str) -> dict:
             # files -> manifest.get("regions") is empty -> no region members read.
             region_crops, region_masks = [], []
             for i in range(len(manifest.get("regions", []) or [])):
-                crop = _read_crop(zf, names, i, prefix="region")
+                crop = _read_crop(zf, names, i, prefix="region", high_bit=high_bit)
                 if crop is None:
                     raise KeyError(f"region_{i:03d}.(png|avif|jxl|jpg)")
                 region_crops.append(crop)

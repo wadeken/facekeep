@@ -398,8 +398,8 @@ def test_fkeep_with_hands_roundtrips_no_version_bump(tmp_path, monkeypatch):
 
     info = read_fkeep_info(fkeep)
     # NO format/manifest bump for hands: the version is whatever the current
-    # schema is (1.7.0 = the preset bump), never a hands-specific one.
-    assert info["version"] == "1.7.0"
+    # schema is (1.8.0 = the high-bit bit_depth bump), never a hands-specific one.
+    assert info["version"] == "1.8.0"
     assert len(info["regions"]) == n
 
     data = read_fkeep(fkeep)

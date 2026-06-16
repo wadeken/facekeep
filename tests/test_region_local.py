@@ -230,9 +230,9 @@ def test_fkeep_has_region_members_and_manifest(tmp_path, monkeypatch):
     assert "region_mask_000.png" in names
 
     info = read_fkeep_info(fkeep)
-    # regions[] were added at 1.3.0; the current schema is 1.7.0 (the preset
-    # key).
-    assert info["version"] == "1.7.0"
+    # regions[] were added at 1.3.0; the current schema is 1.8.0 (the high-bit
+    # bit_depth key).
+    assert info["version"] == "1.8.0"
     assert len(info["regions"]) == 1
     r = info["regions"][0]
     assert r["id"] == 0

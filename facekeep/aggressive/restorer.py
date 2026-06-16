@@ -12,7 +12,7 @@ import numpy as np
 from ..config import AggressiveConfig
 from ..exceptions import ModelDownloadError, RestoreError
 from ..models import ensure_weights
-from .blender import blend_face_onto_background
+from .blender import _match_dtype, blend_face_onto_background
 from .format import _offset_decode_residual, read_fkeep
 
 logger = logging.getLogger("facekeep.aggressive.restorer")
@@ -193,6 +193,11 @@ def _estimate_grain_sigma(crops) -> Optional[float]:
     sigmas = []
     for crop in crops:
         luma = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        if crop.dtype == np.uint16:
+            # A high-bit crop's luma is 0..65535; grain is applied to the 8-bit
+            # background (before any high-bit promotion), so estimate the sigma in
+            # 8-bit units to keep it correctly scaled.
+            luma /= 257.0
         residual = luma - cv2.GaussianBlur(luma, (0, 0), _GRAIN_RESIDUAL_SIGMA)
         mad = float(np.median(np.abs(residual - np.median(residual))))
         sigmas.append(mad * _MAD_TO_SIGMA)
@@ -734,7 +739,7 @@ class Restorer:
         return result
 
     def _write(self, result, output_path, exif, *, icc=None, has_faces=False,
-               quality=70):
+               quality=70, out_bit_depth=8):
         """Write the restored image to a standard file, format chosen by suffix.
 
         Restore is meant to be the "never a dead end" escape hatch (ROADMAP
@@ -757,16 +762,35 @@ class Restorer:
         here and inside ``encoders.encode``, per the repo convention.
         """
         suffix = Path(output_path).suffix.lower()
+        # A uint16 ``result`` means a high-bit (HDR) .fkeep was restored at full
+        # depth. Only AVIF (via the avifenc CLI) can write it; JPEG/PNG/WebP and
+        # the bundled JXL are 8-bit, so those round it down with a clear warning.
+        high_bit = result.dtype == np.uint16
         if suffix in (".avif", ".jxl"):
             from .. import encoders
 
             codec = "avif" if suffix == ".avif" else "jxl"
+            if high_bit and codec == "jxl":
+                logger.warning(
+                    "JXL output is 8-bit here; the restored HDR is rounded down to "
+                    "8-bit. Restore to .avif for true 10/12-bit HDR."
+                )
             data = encoders.encode(
                 result, codec=codec, quality=quality,
                 chroma="auto", has_faces=has_faces, exif=exif, icc=icc,
+                bit_depth=16 if high_bit else 8,
+                output_bit_depth=out_bit_depth if out_bit_depth in (10, 12) else 10,
             )
             encoders.write_encoded(data, output_path, codec)
             return
+
+        if high_bit:
+            logger.warning(
+                "%s is an 8-bit format; the restored HDR is rounded down to 8-bit. "
+                "Restore to .avif for true 10/12-bit HDR.",
+                suffix or "the output format",
+            )
+            result = _match_dtype(result, np.uint8)
 
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
         # Pillow write so EXIF *and* the ICC profile are embedded in one save
@@ -861,12 +885,29 @@ class Restorer:
             grain_sigma = _estimate_grain_sigma(crops)
             if grain_sigma:
                 upscaled = _apply_grain(upscaled, grain_sigma)
+
+        # High-bit restore (manifest 1.8.0+): when the real crops came back at
+        # full depth (uint16, decoded via avifdec), promote the 8-bit hallucinated
+        # background to 16-bit so the dtype-aware compositor preserves the crops'
+        # HDR. If avifdec was unavailable, read_fkeep fell back to 8-bit crops, so
+        # this stays 8-bit (graceful). The background gains no real precision (it
+        # is *257-scaled), but the composited *real* pixels keep theirs — which is
+        # the point (the background is hallucinated either way).
+        out_bit_depth = int((m.get("settings") or {}).get("bit_depth", 8) or 8)
+        crops_all = data["face_crops"] + data["region_crops"]
+        if (
+            out_bit_depth > 8
+            and upscaled.dtype != np.uint16
+            and any(c.dtype == np.uint16 for c in crops_all)
+        ):
+            upscaled = upscaled.astype(np.uint16) * 257
         result = self._composite(upscaled, data)
 
         if output_path:
             self._write(result, output_path, data.get("exif"),
                         icc=data.get("icc"),
-                        has_faces=bool(m["faces"]), quality=quality)
+                        has_faces=bool(m["faces"]), quality=quality,
+                        out_bit_depth=out_bit_depth)
         return result
 
     def preview(self, fkeep_path: str, output_path: Optional[str] = None,

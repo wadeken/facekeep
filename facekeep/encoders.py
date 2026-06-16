@@ -131,6 +131,45 @@ def avifenc_available() -> bool:
     return _find_avifenc() is not None
 
 
+def _find_avifdec() -> Optional[str]:
+    """Locate the external ``avifdec`` binary, or ``None`` if unavailable.
+
+    Reading a true high-bit (10/12-bit) AVIF back at full depth needs the libavif
+    ``avifdec`` CLI: the bundled Pillow plugin decodes AVIF down to 8-bit, which
+    would flatten a high-bit crop on aggressive restore. ``avifdec`` ships beside
+    ``avifenc`` in the libavif release, so resolution order is:
+
+    1. ``$FACEKEEP_AVIFDEC`` (explicit override — an exact path to the binary),
+    2. ``avifdec`` as a sibling of the located ``avifenc`` (so a single
+       ``$FACEKEEP_AVIFENC`` enables *both* the high-bit encode and decode paths),
+    3. ``avifdec`` on the system ``PATH`` (``shutil.which``),
+    4. ``None`` → callers fall back to the 8-bit Pillow decode.
+
+    Offline-first / graceful degradation: a missing binary is not an error.
+    """
+    env = os.environ.get("FACEKEEP_AVIFDEC")
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return str(p)
+        logger.warning(
+            "FACEKEEP_AVIFDEC=%s is not a file; falling back to sibling/PATH.", env
+        )
+    enc = _find_avifenc()
+    if enc:
+        sibling = Path(enc).with_name(
+            "avifdec.exe" if enc.lower().endswith(".exe") else "avifdec"
+        )
+        if sibling.is_file():
+            return str(sibling)
+    return shutil.which("avifdec")
+
+
+def avifdec_available() -> bool:
+    """Return True if the external ``avifdec`` binary can be located."""
+    return _find_avifdec() is not None
+
+
 def encode_highbit_avif(
     image_bgr: np.ndarray,
     *,
@@ -186,18 +225,18 @@ def encode_highbit_avif(
     else:
         png_img = np.clip(image_bgr, 0, 65535).astype(np.uint16)
 
-    # OpenCV writes BGR; avifenc reads a PNG as RGB. Convert at this codec
-    # boundary (the only place BGR->RGB happens on this path), mirroring
-    # _bgr_to_pil for the 8-bit path.
-    png_rgb = cv2.cvtColor(png_img, cv2.COLOR_BGR2RGB)
-
+    # cv2.imwrite already converts a BGR array to a correct RGB PNG (which avifenc
+    # then reads as RGB), so write the BGR ``png_img`` straight through. An
+    # explicit BGR->RGB cvtColor here would *double*-swap — the PNG, and thus the
+    # AVIF, would come back with R and B exchanged (pinned by a known-color
+    # round-trip in tests/test_bit_depth.py).
     subsampling = "444" if (chroma == "444" or (chroma == "auto" and has_faces)) else "420"
 
     tmpdir = tempfile.mkdtemp(prefix="facekeep_avif_")
     try:
         in_png = os.path.join(tmpdir, "in.png")
         out_avif = os.path.join(tmpdir, "out.avif")
-        if not cv2.imwrite(in_png, png_rgb):
+        if not cv2.imwrite(in_png, png_img):
             raise EncodingError("Failed to write temporary 16-bit PNG for avifenc.")
 
         cmd = [
@@ -234,6 +273,54 @@ def encode_highbit_avif(
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def decode_highbit_avif(data: bytes) -> np.ndarray:
+    """Decode AVIF bytes to a **uint16** BGR image via the ``avifdec`` CLI.
+
+    The bundled Pillow AVIF plugin decodes everything down to 8-bit RGB, which
+    would silently flatten a 10/12-bit (HDR) AVIF crop on aggressive restore.
+    ``avifdec -d 16`` writes a true 16-bit PNG, which OpenCV reads back as uint16
+    BGR (``cv2.imread`` returns BGR for a standard RGB PNG — the exact inverse of
+    :func:`encode_highbit_avif`, which writes its BGR source straight to a PNG).
+
+    Returns:
+        A uint16 BGR array. (An 8-bit AVIF routed here is promoted to 16-bit by
+        ``avifdec -d 16``; callers only use this for crops the manifest declares
+        high-bit.)
+
+    Raises:
+        EncodingError: if ``avifdec`` is unavailable or the subprocess fails.
+            Callers that want graceful degradation (read a high-bit crop on a box
+            without ``avifdec``) catch this and fall back to the 8-bit Pillow
+            :func:`decode`.
+    """
+    binary = _find_avifdec()
+    if binary is None:
+        raise EncodingError(
+            "avifdec not found (set FACEKEEP_AVIFDEC or FACEKEEP_AVIFENC, or put "
+            "avifdec on PATH); cannot decode high-bit AVIF at full depth."
+        )
+    tmpdir = tempfile.mkdtemp(prefix="facekeep_avifdec_")
+    try:
+        in_avif = os.path.join(tmpdir, "in.avif")
+        out_png = os.path.join(tmpdir, "out.png")
+        Path(in_avif).write_bytes(data)
+        cmd = [binary, "-d", "16", in_avif, out_png]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise EncodingError(f"avifdec invocation failed: {e}") from e
+        if proc.returncode != 0:
+            raise EncodingError(
+                f"avifdec exited {proc.returncode}: {proc.stderr.strip()[:300]}"
+            )
+        img = cv2.imread(out_png, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            raise EncodingError("avifdec produced no decodable PNG.")
+        return img
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def encode_lossless_avif(
     image_bgr: np.ndarray,
     *,
@@ -261,19 +348,20 @@ def encode_lossless_avif(
             "cannot write lossless AVIF."
         )
 
-    # PNG carries exact samples at the source depth (8- or 16-bit). avifenc reads
-    # the PNG as RGB, so convert at this codec boundary (mirrors the other paths).
+    # PNG carries exact samples at the source depth (8- or 16-bit). cv2.imwrite
+    # converts the BGR array to a correct RGB PNG (which avifenc reads as RGB), so
+    # write ``png_img`` straight through — an explicit cvtColor here would double-
+    # swap R/B (see encode_highbit_avif).
     if image_bgr.dtype not in (np.uint8, np.uint16):
         png_img = np.clip(image_bgr, 0, 255).astype(np.uint8)
     else:
         png_img = image_bgr
-    png_rgb = cv2.cvtColor(png_img, cv2.COLOR_BGR2RGB)
 
     tmpdir = tempfile.mkdtemp(prefix="facekeep_avif_ll_")
     try:
         in_png = os.path.join(tmpdir, "in.png")
         out_avif = os.path.join(tmpdir, "out.avif")
-        if not cv2.imwrite(in_png, png_rgb):
+        if not cv2.imwrite(in_png, png_img):
             raise EncodingError("Failed to write temporary PNG for avifenc.")
 
         # -l forces lossless (identity transform, 4:4:4, lossless quantizer).

@@ -15,7 +15,7 @@ all** (see [Manual recovery](#manual-recovery-without-facekeep)).
 - **Extension:** `.fkeep`
 - **Container:** a ZIP archive (`zipfile.ZIP_DEFLATED`). Anything that opens a
   `.zip` opens a `.fkeep` — just rename it, or point `unzip` straight at it.
-- **Current manifest version:** `1.7.0` (see [Versioning](#versioning--compatibility)).
+- **Current manifest version:** `1.8.0` (see [Versioning](#versioning--compatibility)).
 
 ---
 
@@ -112,6 +112,15 @@ Notes:
   unavailable at compress time). `residual.jxl` decodes with the faithful-mode
   Pillow plugin, `residual.jpg` with OpenCV — the same split as the other
   members. Files with `settings.residual` false/absent have no residual member.
+- **High-bit (HDR) crops** *(1.8.0+)*. When `settings.bit_depth` is `10` or `12`,
+  the **real-pixel** members (face crops + region patches) are stored as true
+  high-bit **AVIF** (`face_NNN.avif` / `region_NNN.avif`, via the `avifenc` CLI),
+  so a 10/12-bit HDR source keeps its depth. The background, thumbnail, and
+  residual are **always 8-bit** (the background is hallucinated on restore, so
+  high-bit there buys nothing). Restore decodes these crops at full depth with
+  `avifdec` and writes true HDR only to an `.avif`/`.jxl` output (a JPEG output
+  rounds down, warned). Absent `bit_depth` (the default 8-bit container and all
+  pre-1.8.0 files) means every member is 8-bit, exactly as before.
 - `thumbnail.jpg` is a convenience preview only; restore ignores it.
 - A well-formed `.fkeep` therefore has `2 + 2·N + 2·R` image members plus the
   manifest (and `+1` each for `exif.bin` / `icc.bin` if the source carried EXIF /
@@ -132,7 +141,7 @@ keys (all present on a v1.1.0 file written by the current code):
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `version` | string | **Manifest schema version** (`"1.6.0"`). Independent of the tool version. |
+| `version` | string | **Manifest schema version** (`"1.8.0"`). Independent of the tool version. |
 | `mode` | string | Always `"aggressive"` (only aggressive mode writes `.fkeep`). |
 | `original` | object | Facts about the original input file — see below. |
 | `exif_preserved` | bool | `true` iff an `exif.bin` member is present. |
@@ -172,6 +181,7 @@ keys (all present on a v1.1.0 file written by the current code):
 | `bg_codec` | string | Codec for the background: `jpg` (default) \| `avif` \| `jxl`. `avif`/`jxl` are stored 4:2:0. *(Added in manifest `1.5.0`; absent on older files, where it is `jpg`.)* Informational — readers locate the background by member extension, not this field. |
 | `face_quality` | int | Quality used for face crops; `>= 100` means crops are lossless PNG (overrides `face_codec`). |
 | `face_codec` | string | Codec for face crops: `jpg` (default) \| `avif` \| `jxl`. `avif`/`jxl` are stored 4:4:4. *(Added in manifest `1.2.0`; absent on older files, where it is `jpg`.)* Informational — readers locate crops by member extension, not this field. |
+| `bit_depth` | int | *(1.8.0+, optional)* Bit depth of the stored **real-pixel** members (face crops + region patches): `10` or `12` when they were stored as true high-bit AVIF (via the `avifenc` CLI, for a 10/12-bit HDR source). **Absent** on the default 8-bit container and all older files — readers treat absent as `8`. The background/thumbnail/residual are always 8-bit. Restore decodes these AVIF crops at full depth (`avifdec`) and writes true HDR only to an avif/jxl output (a JPEG output rounds down, warned). |
 | `blend_mode` | string | Soft-mask compositing mode (`gaussian` \| `linear` \| `poisson`). |
 | `model` | string | The super-resolution model name requested for restore (e.g. `realesrgan-x4plus`). |
 | `residual` | bool | *(1.6.0+)* Presence flag for the residual layer: `true` iff a `residual.(jxl\|jpg)` member is present. Restore then reconstructs the background from real data (bicubic + residual) and skips the AI upscale. |
@@ -217,7 +227,7 @@ A real two-face manifest (values illustrative):
 
 ```json
 {
-  "version": "1.7.0",
+  "version": "1.8.0",
   "mode": "aggressive",
   "original": {
     "filename": "2024.05.20_trip.jpg",
@@ -475,7 +485,7 @@ rather than implying it passed.
 
 ## Versioning & compatibility
 
-- **`version`** is the manifest schema version (currently `1.7.0`) and is
+- **`version`** is the manifest schema version (currently `1.8.0`) and is
   separate from `facekeep_version` (the tool version that wrote the file). Schema
   history: `1.2.0` added `settings.face_codec` (AVIF/JXL face crops); `1.3.0`
   added the `regions[]` array and the `region_NNN.*` / `region_mask_NNN.png`
@@ -490,7 +500,11 @@ rather than implying it passed.
   just without the residual's fidelity); `1.7.0` added the optional
   `settings.preset` key (the aggressive-mode preset the file was compressed
   with — a restore hint; presetless files carry no key at all and a reader that
-  ignores it restores identically).
+  ignores it restores identically); `1.8.0` added the optional
+  `settings.bit_depth` key and high-bit (10/12-bit) AVIF face/region crops (an
+  HDR source via the `avifenc` CLI — the background stays 8-bit; absent on the
+  default 8-bit container and older files, where every member is 8-bit, and a
+  reader that ignores it still restores via the 8-bit Pillow decode).
 - Readers are **tolerant by structure, not by strict schema validation**: they
   locate members by name (`background.(jpg|avif|jxl)`, `face_NNN.*`,
   `face_mask_NNN.png`,

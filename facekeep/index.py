@@ -101,6 +101,9 @@ def settings_fingerprint(config: FaceKeepConfig) -> str:
             "bg_codec": config.aggressive.bg_codec,
             "face_quality": config.aggressive.face_quality,
             "face_codec": config.aggressive.face_codec,
+            # High-bit crop/region storage changes the stored crop bytes (true
+            # 10/12-bit AVIF vs 8-bit), so it must bust the cache.
+            "output_bit_depth": config.aggressive.output_bit_depth,
             "no_face_strategy": config.aggressive.no_face_strategy,
             "no_face_bg_scale": config.aggressive.no_face_bg_scale,
             "blend_mode": config.aggressive.blend_mode,

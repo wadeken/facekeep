@@ -394,6 +394,33 @@ residual), and the `.fkeep` gets larger — the explicit trade. All three knobs
 (`residual`/`residual_scale`/`residual_quality`) are output-affecting and feed
 `settings_fingerprint`.
 
+**High-bit (HDR) crops** (`aggressive.output_bit_depth`, default `8` = off |
+`10` | `12`) let an iPhone-style HDR source survive aggressive mode. The `.fkeep`
+is an 8-bit container by default — every member is rounded down to 8-bit (a
+10/12-bit HDR HEIC, decoded as uint16, included), so only faithful mode preserved
+HDR. When enabled, the **real-pixel** members — face crops *and* region patches —
+are stored at true high bit depth via the `avifenc` 10/12-bit AVIF path, so the
+detail the user actually cares about (faces, hands, sharp regions) keeps its
+depth. The **background, thumbnail, and residual stay 8-bit**: the background is
+hallucinated on restore, so high-bit there buys nothing — the win concentrates on
+the real pixels, which is the honest scope. It is **gated** on
+`face_codec: avif` plus the locatable `avifenc` (encode) and `avifdec` (decode)
+binaries, and degrades gracefully to the warned 8-bit round-down otherwise
+(offline-first holds; the default 8-bit container is byte-identical). Restore
+decodes the high-bit crops at full depth (`avifdec`), promotes the 8-bit
+hallucinated background to 16-bit, composites the real uint16 crops, and writes
+true HDR **only to an `.avif` output** (`restore -f avif`); a JPEG/PNG/JXL output
+rounds down with a warning, since those are 8-bit here. It is an explicit
+fidelity↔ratio trade — high-bit crops are larger, so the `.fkeep` grows — hence
+off by default; `output_bit_depth` is output-affecting and feeds
+`settings_fingerprint`, and the stored depth is recorded as the optional
+`settings.bit_depth` manifest key (1.8.0+, absent on an 8-bit container). The
+residual layer is **not** yet high-bit (its offset encoding is 8-bit) — a tracked
+follow-up. *(Aside: implementing this surfaced and fixed a latent R/B-swap bug in
+the shared `avifenc` encode path — `encode_highbit_avif` / `encode_lossless_avif`
+double-applied a BGR→RGB conversion, so faithful mode's 10/12-bit and lossless
+AVIF output had red/blue exchanged; now pinned by a color round-trip test.)*
+
 **Face enhancement of reconstructed background faces** is the restore-side
 safety net for the recall guardrails above. Detection biases toward recall, but
 a face it still misses is downsampled with the background and then *upscaled* by

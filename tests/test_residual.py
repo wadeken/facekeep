@@ -194,7 +194,7 @@ def test_residual_member_and_manifest(tmp_path):
 
     assert _residual_member(fkeep) == "residual.jxl"
     info = read_fkeep_info(str(fkeep))
-    assert info["version"] == "1.7.0"
+    assert info["version"] == "1.8.0"
     assert info["settings"]["residual"] is True
     assert info["settings"]["residual_scale"] == 0.5
     assert info["settings"]["residual_quality"] == 60
@@ -202,13 +202,13 @@ def test_residual_member_and_manifest(tmp_path):
 
 def test_default_writes_no_residual_member(tmp_path):
     """The default (residual off) writes no member and flags False — but the
-    schema version is still 1.7.0 (it describes the writer, like 1.5.0 did)."""
+    schema version is still 1.8.0 (it describes the writer, like 1.5.0 did)."""
     photo = _photo_with_residual(_detailed_original(480, 320), residual=False)
     fkeep = _write(photo, tmp_path, "plain")
 
     assert _residual_member(fkeep) is None
     info = read_fkeep_info(str(fkeep))
-    assert info["version"] == "1.7.0"
+    assert info["version"] == "1.8.0"
     assert info["settings"]["residual"] is False
 
 

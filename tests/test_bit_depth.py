@@ -258,6 +258,46 @@ def test_highbit_path_only_for_uint16_avif(tmp_path, monkeypatch):
 
 
 @avifenc_required
+def test_highbit_avif_preserves_channel_order():
+    """Regression: the high-bit AVIF path must not swap R/B.
+
+    ``encode_highbit_avif`` writes the source through a temp PNG for avifenc. An
+    earlier version applied an explicit BGR->RGB cvtColor *on top of* cv2.imwrite's
+    own BGR->RGB conversion — a double swap, so a red photo came back blue. Pin
+    color identity: distinct R/G/B blocks (BGR) must decode with the same dominant
+    channel. Decoding via Pillow (8-bit) is enough — channel *order* is what we
+    check here, not depth (depth is covered by the banding test below).
+    """
+    img = np.zeros((32, 48, 3), np.uint16)
+    img[:, :16, 2] = 60000    # red   (BGR ch2)
+    img[:, 16:32, 1] = 55000  # green (ch1)
+    img[:, 32:, 0] = 50000    # blue  (ch0)
+    dec = encoders.decode(encoders.encode_highbit_avif(img, bit_depth=10, quality=95))
+    assert int(np.argmax(dec[16, 8])) == 2, "red block must stay in ch2 (no R/B swap)"
+    assert int(np.argmax(dec[16, 24])) == 1, "green block must stay in ch1"
+    assert int(np.argmax(dec[16, 40])) == 0, "blue block must stay in ch0"
+
+
+@avifenc_required
+def test_lossless_avif_is_bit_exact_and_channel_correct():
+    """Regression: avifenc lossless AVIF round-trips bit-exact (no R/B swap).
+
+    ``encode_lossless_avif`` had the same double-swap bug; a "lossless" round-trip
+    that exchanged channels is not bit-exact. With the fix, decode == source
+    exactly (Pillow decodes 8-bit AVIF losslessly), pinning BOTH losslessness and
+    correct channel order in one assertion.
+    """
+    rng = np.random.default_rng(0)
+    img = np.zeros((32, 48, 3), np.uint8)
+    img[:, :16, 2] = 230    # red
+    img[:, 16:32, 1] = 200  # green
+    img[:, 32:, 0] = 180    # blue
+    img = np.clip(img + rng.integers(0, 8, img.shape), 0, 255).astype(np.uint8)
+    dec = encoders.decode(encoders.encode_lossless_avif(img))
+    assert np.array_equal(dec, img), "lossless AVIF must round-trip bit-exact (no R/B swap)"
+
+
+@avifenc_required
 def test_smooth_gradient_no_banding_roundtrip(tmp_path):
     """CORE-GOAL acceptance: a smooth 16-bit gradient must not band on restore.
 
