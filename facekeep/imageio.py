@@ -47,10 +47,12 @@ class LoadedImage:
     height: int
     icc: Optional[bytes] = None  # Original ICC color profile (e.g. Display P3)
     source_bit_depth: int = 8  # 8 or 16: the per-channel bit depth of the source.
-    # NOTE: the bundled AVIF/JXL encoders have no high-bit path (see encoders.py),
-    # so >8-bit sources are currently down-converted to 8-bit at the encode
-    # boundary. This field records the source depth for an honest warning and for
-    # a future true-high-bit encode path (avifenc CLI — ROADMAP Phase 1 follow-up).
+    # A 16-bit source — a 16-bit PNG/TIFF (IMREAD_UNCHANGED) or a 10/12-bit HDR
+    # HEIC decoded high-bit via pillow_heif.open_heif (see _decode_heif) — carries
+    # uint16 pixels with source_bit_depth=16, which encoders.encode routes to the
+    # true 10/12-bit avifenc AVIF output path. Without the avifenc binary (or for
+    # JXL/WebP) it rounds down to 8-bit at the encode boundary with a loud warning
+    # (never a silent truncation).
 
 
 def _strip_gps_from_exif(exif_bytes: Optional[bytes]) -> Optional[bytes]:
@@ -191,6 +193,61 @@ def _normalize_to_bgr(image: np.ndarray) -> np.ndarray:
     return image  # already 3-channel BGR
 
 
+def _decode_heif(path: Path) -> tuple[np.ndarray, int, Optional[bytes], Optional[bytes]]:
+    """Decode a HEIC/HEIF fully via ``pillow_heif.open_heif`` — never PIL ``Image.open``.
+
+    Returns ``(bgr, source_bit_depth, exif_bytes, icc)``.
+
+    **Why open_heif and never Image.open for HEIC.** Opening the *same* HEIC file
+    with both the PIL HEIF plugin (``Image.open``) and ``open_heif`` in one
+    process segfaults inside libheif — two libheif contexts on one file collide,
+    and a ``close()`` does not help (verified). ``open_heif`` is stable on its
+    own and is the only API here that yields the genuine >8-bit samples, so HEIC
+    reads pixels *and* EXIF *and* ICC from ``open_heif`` exclusively (this is why
+    HEIC no longer goes through the shared ``Image.open`` plugin path that AVIF /
+    JXL still use — those have no high-bit decode here and no dual-API hazard).
+
+    **High bit depth (the point of this path).** ``convert_hdr_to_8bit=False``
+    decodes a 10/12-bit HDR source to a ``uint16`` array (pillow-heif mode
+    ``"RGB;16"``, the 10-bit values scaled into the 16-bit range), so
+    ``source_bit_depth=16`` carries real high-bit data into the ``avifenc``
+    10/12-bit AVIF output path (``encoders.encode`` routes uint16+avif there). An
+    8-bit HEIC decodes to ``uint8`` (``"RGB"``) — the same result the old
+    ``Image.open`` path produced. Without ``avifenc`` the uint16 array simply
+    rounds down to 8-bit at the encode boundary with the standard warning, the
+    same honest fallback as a 16-bit PNG (offline-first / graceful degradation).
+
+    **Orientation.** ``open_heif`` applies the EXIF/irot orientation to the
+    pixels itself (they come out upright) but does *not* clear the EXIF
+    orientation tag. So the caller must apply NO further rotation, and we
+    normalize the carried EXIF's tag to 1 here (matching what the PIL plugin
+    exposes on the 8-bit HEIC path) so a re-embed never double-rotates.
+    """
+    import pillow_heif
+
+    # register_heif_opener() only patches PIL's Image.open; open_heif is the
+    # low-level reader and does not require it, but calling it is harmless and
+    # keeps the plugin initialized. It opens nothing, so it adds no second
+    # libheif context (no dual-API crash).
+    pillow_heif.register_heif_opener()
+    heif_file = pillow_heif.open_heif(str(path), convert_hdr_to_8bit=False)
+    himg = heif_file[0]
+    arr = np.asarray(himg)  # uint8 (8-bit) or uint16 (HDR); RGB / RGBA / grayscale
+    if arr.ndim == 2:
+        bgr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    elif arr.shape[2] == 4:
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+    else:
+        bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    source_bit_depth = 16 if arr.dtype == np.uint16 else 8
+    icc = himg.info.get("icc_profile")
+    # open_heif leaves the orientation tag set even though it rotated the pixels,
+    # so normalize the carried tag to 1 (the raw value is discarded — the pixels
+    # are already upright, so the caller applies orientation 1 = a no-op).
+    exif_bytes, _orig_orientation = _normalize_orientation_in_exif(himg.info.get("exif"))
+    return bgr, source_bit_depth, exif_bytes, icc
+
+
 def load(path: str, strip_gps: bool = False) -> LoadedImage:
     """Load an image, applying EXIF orientation and preserving EXIF bytes.
 
@@ -213,17 +270,30 @@ def load(path: str, strip_gps: bool = False) -> LoadedImage:
     source_bit_depth = 8
     exif_bytes: Optional[bytes] = None
     orientation = 1
-    if suffix in PLUGIN_INPUT:
-        # HEIC/AVIF/JXL: decode via Pillow (needs plugin)
+    if suffix in {".heic", ".heif"}:
+        # HEIC/HEIF: decode via pillow_heif.open_heif ONLY (never PIL Image.open)
+        # so a 10/12-bit HDR source keeps its high-bit pixels — see _decode_heif
+        # for the full rationale (and why mixing the two APIs on one HEIC crashes).
+        try:
+            image, source_bit_depth, exif_bytes, icc = _decode_heif(p)
+            # open_heif already applied the orientation (pixels upright) and
+            # _decode_heif normalized the carried tag to 1, so the uniform
+            # orientation step below must NOT rotate again.
+            orientation = 1
+        except ImportError as e:
+            raise UnsupportedInputError(
+                f"Reading {suffix} requires an extra plugin: {e}"
+            ) from e
+        except Exception as e:  # noqa: BLE001
+            raise UnsupportedInputError(f"Cannot read {path}: {e}") from e
+    elif suffix in {".avif", ".jxl"}:
+        # AVIF/JXL: decode via Pillow (needs plugin). The bundled plugins render
+        # 8-bit (no high-bit decode here), and there is no dual-API hazard since
+        # we never call open_heif on these — so this keeps the original path.
         try:
             from PIL import Image
 
-            if suffix in {".heic", ".heif"}:
-                import pillow_heif
-
-                # The HEIF opener is not auto-registered on import.
-                pillow_heif.register_heif_opener()
-            elif suffix == ".avif":
+            if suffix == ".avif":
                 import pillow_avif  # noqa: F401
             elif suffix == ".jxl":
                 import pillow_jxl  # noqa: F401
@@ -231,8 +301,8 @@ def load(path: str, strip_gps: bool = False) -> LoadedImage:
             # Grab the ICC profile before convert() (convert may drop it).
             icc = pil.info.get("icc_profile")
             # Read orientation off the decoded Pillow image: piexif.load(path)
-            # cannot parse HEIC/AVIF/JXL containers, so the path-based reader
-            # would silently lose orientation for these formats.
+            # cannot parse AVIF/JXL containers, so the path-based reader would
+            # silently lose orientation for these formats.
             exif_bytes, orientation = _read_exif_orientation_from_pil(pil)
             # Pillow's high-bit modes (I;16, I) signal a >8-bit source even
             # though convert("RGB") below renders 8-bit (no high-bit decode here).

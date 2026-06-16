@@ -540,7 +540,13 @@ documented in [fkeep-format.md](fkeep-format.md).
   "perceptual when available, SSIM otherwise." Also exposed for inspection via
   `facekeep quality --ssimulacra2`.
 - **imageio.py** — `load()` with EXIF orientation correction and EXIF + ICC
-  color-profile preservation; the single entry point for reading images.
+  color-profile preservation; the single entry point for reading images. A
+  **10/12-bit HDR HEIC** is decoded high-bit (`_decode_heif` →
+  `pillow_heif.open_heif(convert_hdr_to_8bit=False)` → `uint16` BGR,
+  `source_bit_depth=16`), so it feeds the `avifenc` 10/12-bit AVIF output path
+  instead of being flattened to 8-bit; HEIC uses `open_heif` *exclusively* (never
+  PIL `Image.open`) because opening one HEIC with both APIs in a process
+  segfaults libheif.
 - **faithful.py** — the default pipeline.
 - **index.py** — incremental-processing cache (stdlib `sqlite3`): records each
   file's content hash + settings fingerprint + output path so a re-run skips
