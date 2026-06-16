@@ -213,6 +213,11 @@ def _apply_grain(bg: np.ndarray, sigma: float) -> np.ndarray:
     rather than salt-and-pepper, added identically to all three BGR channels —
     luma-only grain; chroma noise looks wrong. Seeded RNG keeps restore
     deterministic: the same ``.fkeep`` restores to the same bytes every run.
+
+    Dtype-aware: ``sigma`` is estimated in 8-bit units (see
+    ``_estimate_grain_sigma``), so for a uint16 background (a high-bit residual
+    restore) the strength and clip range are scaled to 16-bit (``x257`` / 65535)
+    and a uint16 result is returned. The uint8 path is byte-identical to before.
     """
     if sigma <= 0:
         return bg
@@ -225,9 +230,11 @@ def _apply_grain(bg: np.ndarray, sigma: float) -> np.ndarray:
     std = float(noise.std())
     if std <= 0:
         return bg
-    noise *= sigma / std
+    scale = 257.0 if bg.dtype == np.uint16 else 1.0
+    noise *= (sigma * scale) / std
     out = bg.astype(np.float32) + noise[:, :, None]
-    return np.clip(out, 0, 255).astype(np.uint8)
+    max_val = 65535 if bg.dtype == np.uint16 else 255
+    return np.clip(out, 0, max_val).astype(bg.dtype)
 
 
 # --- Residual layer (ROADMAP 8.5) ------------------------------------------- #
@@ -244,16 +251,28 @@ def _apply_residual(bg: np.ndarray, residual: np.ndarray,
                     width: int, height: int) -> np.ndarray:
     """Reconstruct the background from real data: bicubic upscale + residual.
 
-    ``residual`` is the offset-encoded uint8 member as stored (see
+    ``residual`` is the offset-encoded member as stored (see
     ``format._offset_encode_residual``); its signed delta is resized to full
     resolution with INTER_CUBIC — the same interpolation the compress side used
-    to compute it (a pinned contract, see ``format._encode_residual``) — and
-    added on top of the bicubic upscale, clipped back to uint8.
+    to compute it (a pinned contract, see ``format._encode_residual``) — and added
+    on top of the bicubic upscale of the (always 8-bit) stored background.
+
+    **8-bit residual** (uint8 member): added to the 8-bit upscale, clipped to
+    uint8 — unchanged.
+
+    **High-bit (HDR) residual** (uint16 member, decoded via avifdec): the stored
+    background is 8-bit, so its upscale is promoted to the 16-bit scale (``x257``)
+    before the (16-bit) delta is added, and the result is uint16 — mirroring the
+    compress-side ``original_u16 - 257*bicubic(bg)``. So a uint16 source's
+    background comes back at full depth, not flattened to 8-bit.
     """
     up = cv2.resize(bg, (width, height), interpolation=cv2.INTER_CUBIC)
     delta = _offset_decode_residual(residual)
     if delta.shape[:2] != (height, width):
         delta = cv2.resize(delta, (width, height), interpolation=cv2.INTER_CUBIC)
+    if residual.dtype == np.uint16:
+        up16 = up.astype(np.float32) * 257.0
+        return np.clip(up16 + delta, 0, 65535).astype(np.uint16)
     return np.clip(up.astype(np.float32) + delta, 0, 255).astype(np.uint8)
 
 
@@ -926,6 +945,12 @@ class Restorer:
         if data.get("residual") is not None:
             upscaled = _apply_residual(data["background"], data["residual"],
                                        ow, oh)
+            # Preview stays fast 8-bit: a high-bit residual yields a uint16
+            # background, but preview down-converts (the same choice the high-bit
+            # *crop* preview path makes via the blender's _match_dtype) so the
+            # interactive/bench proxy isn't paying for HDR it won't show.
+            if upscaled.dtype == np.uint16:
+                upscaled = _match_dtype(upscaled, np.uint8)
         else:
             upscaled = cv2.resize(data["background"], (ow, oh),
                                   interpolation=cv2.INTER_CUBIC)

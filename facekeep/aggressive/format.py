@@ -122,42 +122,75 @@ def _read_bg(zf: zipfile.ZipFile, names: set) -> Optional[np.ndarray]:
 
 
 # Residual-member extensions, in reader search order (manifest 1.6.0+ may store
-# the residual layer when aggressive.residual is on). JXL is the preferred codec
-# (it wins on the residual's noise-like content — the face_codec measurements);
-# jpg is the warned fallback when the JXL plugin is unavailable. Load-bearing
-# order like _CROP_EXTS/_BG_EXTS (see docs/fkeep-format.md), same decode split:
-# jxl through encoders.decode (Pillow), jpg through cv2.
-_RESIDUAL_EXTS = ("jxl", "jpg")
+# the residual layer when aggressive.residual is on). A high-bit (HDR) residual is
+# stored as a true 10/12-bit ``avif`` (manifest 1.9.0+, only when high-bit storage
+# is engaged); an 8-bit residual is ``jxl`` (preferred — it wins on the residual's
+# noise-like content) or ``jpg`` (the warned fallback when the JXL plugin is
+# unavailable). A file has exactly ONE residual member, so the ``avif`` extension
+# self-describes a high-bit residual (unlike a crop's ambiguous ``.avif``).
+# Load-bearing order like _CROP_EXTS/_BG_EXTS (see docs/fkeep-format.md), with the
+# decode split: avif high-bit through avifdec (uint16), jxl through encoders.decode
+# (Pillow), jpg through cv2.
+_RESIDUAL_EXTS = ("avif", "jxl", "jpg")
 
 
-def _offset_encode_residual(residual: np.ndarray) -> np.ndarray:
-    """Offset-encode a signed float residual into uint8: ``clip(r/2 + 128)``.
+def _offset_encode_residual(residual: np.ndarray, *,
+                            high_bit: bool = False) -> np.ndarray:
+    """Offset-encode a signed float residual into uint8/uint16: ``clip(r/2 + mid)``.
 
-    Halving costs ~1 bit of precision — fine for a correction layer — and maps
-    the +-255 signed range into 0..255. The inverse is
-    :func:`_offset_decode_residual`; the transform is documented in
-    docs/fkeep-format.md so manual recovery works without FaceKeep.
+    Halving costs ~1 bit of precision — fine for a correction layer — and maps the
+    signed range into the unsigned container. 8-bit (default): ``r/2 + 128`` into
+    ``uint8`` (the +-255 range). ``high_bit`` (HDR residual): ``r/2 + 32768`` into
+    ``uint16`` (the +-65535 range), stored as a true 10/12-bit AVIF so a uint16
+    source's background delta keeps its depth. The inverse is
+    :func:`_offset_decode_residual` (which infers the depth from dtype); both
+    transforms are documented in docs/fkeep-format.md so manual recovery works
+    without FaceKeep.
     """
+    if high_bit:
+        return np.clip(np.rint(residual / 2.0 + 32768.0), 0, 65535).astype(np.uint16)
     return np.clip(np.rint(residual / 2.0 + 128.0), 0, 255).astype(np.uint8)
 
 
 def _offset_decode_residual(encoded: np.ndarray) -> np.ndarray:
-    """Invert :func:`_offset_encode_residual`: uint8 -> signed float32 delta."""
+    """Invert :func:`_offset_encode_residual`: uint8/uint16 -> signed float32 delta.
+
+    The depth is inferred from dtype: a ``uint16`` member is a high-bit (HDR)
+    residual (``r = e*2 - 65536``); a ``uint8`` member is the 8-bit residual
+    (``r = e*2 - 256``). So a high-bit residual decoded at full depth via avifdec
+    (uint16) reconstructs correctly without any extra flag.
+    """
+    if encoded.dtype == np.uint16:
+        return encoded.astype(np.float32) * 2.0 - 65536.0
     return encoded.astype(np.float32) * 2.0 - 256.0
 
 
 def _encode_residual(original: np.ndarray, bg_bytes: bytes, bg_ext: str,
-                     cfg) -> Tuple[str, bytes]:
-    """Encode the residual layer, returning (extension, bytes).
+                     cfg) -> Tuple[str, bytes, int]:
+    """Encode the residual layer, returning (extension, bytes, stored_bit_depth).
 
     ``residual = original - bicubic(decoded background)`` — computed against the
     background bytes *as just encoded* (decode them back), NOT the pre-encode
     array, so the residual corrects the bg codec's loss instead of fighting it;
     and with the same interpolation restore uses (INTER_CUBIC both sides — a
     pinned contract, see restorer._apply_residual). The signed residual is
-    downscaled (INTER_AREA) to ``residual_scale``, offset-encoded to uint8, and
-    stored as JXL at ``residual_quality`` (jpg fallback, warned, when the JXL
-    plugin is unavailable).
+    downscaled (INTER_AREA) to ``residual_scale``, offset-encoded, and stored.
+
+    **8-bit (default):** offset-encoded to uint8 and stored as JXL at
+    ``residual_quality`` (jpg fallback, warned, when the JXL plugin is
+    unavailable); ``stored_bit_depth`` is 8.
+
+    **High-bit (HDR):** a ``uint16`` original (high-bit storage engaged, so the
+    compressor hands the full-depth original here) is reconstructed toward its
+    real uint16 values — the stored background is 8-bit, so its bicubic upscale is
+    promoted to the 16-bit scale (``x257``) before differencing
+    (``restorer._apply_residual`` mirrors this). The delta is offset-encoded to
+    uint16 and stored as a true 10/12-bit AVIF via ``encode_highbit_avif`` (4:4:4 —
+    a correction layer must not lose chroma); ``stored_bit_depth`` is that depth.
+    If ``avifenc`` is unavailable (or the high-bit encode fails) the residual
+    cleanly degrades to the 8-bit path above (the uint16 original down-converted
+    with ``_to_uint8`` + warned) — offline-first holds, the 8-bit residual is
+    unchanged.
     """
     from .. import encoders
 
@@ -166,37 +199,96 @@ def _encode_residual(original: np.ndarray, bg_bytes: bytes, bg_ext: str,
     else:
         decoded_bg = _decode(bg_bytes)
     h, w = original.shape[:2]
-    ref = cv2.resize(decoded_bg, (w, h), interpolation=cv2.INTER_CUBIC)
-    residual = original.astype(np.float32) - ref.astype(np.float32)
+    ref = cv2.resize(decoded_bg, (w, h), interpolation=cv2.INTER_CUBIC)  # 8-bit BGR
+
     rw = max(1, int(round(w * cfg.residual_scale)))
     rh = max(1, int(round(h * cfg.residual_scale)))
-    if (rw, rh) != (w, h):
-        residual = cv2.resize(residual, (rw, rh), interpolation=cv2.INTER_AREA)
-    encoded = _offset_encode_residual(residual)
+
+    def _downscale(res: np.ndarray) -> np.ndarray:
+        if (rw, rh) != (w, h):
+            return cv2.resize(res, (rw, rh), interpolation=cv2.INTER_AREA)
+        return res
+
+    # High-bit (HDR) residual: a uint16 original + a locatable avifenc. The stored
+    # background is 8-bit, so promote its upscale to the uint16 scale before
+    # differencing. On any avifenc failure, fall through to the 8-bit path.
+    if original.dtype == np.uint16 and encoders.avifenc_available():
+        residual = original.astype(np.float32) - ref.astype(np.float32) * 257.0
+        encoded = _offset_encode_residual(_downscale(residual), high_bit=True)
+        try:
+            data = encoders.encode_highbit_avif(
+                encoded, bit_depth=cfg.output_bit_depth,
+                quality=cfg.residual_quality, chroma="444", has_faces=True,
+            )
+            return "avif", data, cfg.output_bit_depth
+        except encoders.EncodingError as e:
+            logger.warning("High-bit residual encode failed (%s); storing it 8-bit.", e)
+
+    # 8-bit residual (default, or the high-bit fallback). Down-convert a uint16
+    # original (high-bit requested but avifenc unavailable) to match the 8-bit
+    # background it corrects — the clean /257 round-down, not a CV_8U cast.
+    if original.dtype == np.uint16:
+        if not encoders.avifenc_available():
+            logger.warning(
+                "output_bit_depth=%d residual requested but avifenc is "
+                "unavailable; storing the residual 8-bit (install avifenc / set "
+                "FACEKEEP_AVIFENC to keep HDR).",
+                cfg.output_bit_depth,
+            )
+        original = _to_uint8(original)
+    residual = original.astype(np.float32) - ref.astype(np.float32)
+    encoded = _offset_encode_residual(_downscale(residual))
     if encoders.codec_available("jxl"):
         return "jxl", encoders.encode(
             encoded, codec="jxl", quality=cfg.residual_quality,
-        )
+        ), 8
     logger.warning(
         "JXL plugin unavailable; storing the residual layer as JPEG instead "
         "(larger / lossier on this noise-like content)."
     )
-    return "jpg", _jpg(encoded, cfg.residual_quality)
+    return "jpg", _jpg(encoded, cfg.residual_quality), 8
 
 
-def _read_residual(zf: zipfile.ZipFile, names: set) -> Optional[np.ndarray]:
+def _read_residual(zf: zipfile.ZipFile, names: set, *,
+                   avifdec_strict: bool = True) -> Optional[np.ndarray]:
     """Decode the residual member from an open archive, or None if absent.
 
-    Tries ``residual.(jxl|jpg)`` in ``_RESIDUAL_EXTS`` order with the usual
-    decode split (jxl via encoders.decode, jpg via cv2). Returns the
-    offset-encoded uint8 array — decoding the offset back to a signed delta is
-    the restorer's job (:func:`_offset_decode_residual`).
+    Tries ``residual.(avif|jxl|jpg)`` in ``_RESIDUAL_EXTS`` order. Returns the
+    offset-encoded array as stored (uint16 for a high-bit ``avif`` residual, uint8
+    for ``jxl``/``jpg``); decoding the offset back to a signed delta is the
+    restorer's job (:func:`_offset_decode_residual`, which keys off the dtype).
+
+    The decode split: ``jxl`` via ``encoders.decode`` (Pillow), ``jpg`` via cv2.
+    A high-bit ``avif`` residual depends on ``avifdec_strict``:
+
+    * ``True`` (restore/preview, via :func:`read_fkeep`): decode at full depth via
+      ``avifdec`` (uint16). If ``avifdec`` is unavailable, returns ``None`` + warns
+      — restore then falls back to the AI/bicubic path. A Pillow 8-bit decode is
+      *not* used here: the offset was 16-bit (``r/2 + 32768``), so an 8-bit decode
+      would mis-scale into garbage; skipping the residual is the only safe option.
+    * ``False`` (``verify_fkeep``): decode via Pillow (8-bit) purely to confirm the
+      member is a structurally valid image — no avifdec dependency, mirroring how
+      verify checks high-bit ``avif`` *crops*.
     """
     for ext in _RESIDUAL_EXTS:
         member = f"residual.{ext}"
         if member not in names:
             continue
         raw = zf.read(member)
+        if ext == "avif":
+            from .. import encoders
+
+            if avifdec_strict:
+                try:
+                    return encoders.decode_highbit_avif(raw)
+                except EncodingError as e:
+                    logger.warning(
+                        "High-bit residual needs avifdec (%s); restoring without "
+                        "the residual layer (install avifdec / set FACEKEEP_AVIFENC "
+                        "or FACEKEEP_AVIFDEC for the faithful background).", e
+                    )
+                    return None
+            return encoders.decode(raw)
         if ext == "jxl":
             from .. import encoders
 
@@ -375,17 +467,27 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
     region_enc = [_encode_crop(crop, cfg) for crop in photo.region_crops]
     face_payloads = [(ext, data) for ext, data, _ in face_enc]
     region_payloads = [(ext, data) for ext, data, _ in region_enc]
-    stored_bit_depth = max((d for _, _, d in face_enc + region_enc), default=8)
     mask_payloads = [_mask_png(m) for m in photo.face_masks]
     region_mask_payloads = [_mask_png(m) for m in photo.region_masks]
     # Residual layer (opt-in): needs both the flag and the attached original
     # (compress_photo gates the latter on the former). Encoded here, in the
     # shared pre-encode block, so dry-run and the real write pack identically.
+    # _encode_residual returns its stored depth too — 10/12 for a high-bit (HDR)
+    # residual stored as residual.avif (a uint16 original + avifenc), else 8.
     residual_payload = None
+    residual_bit_depth = 8
     if cfg.residual and photo.original_image is not None:
-        residual_payload = _encode_residual(
+        r_ext, r_bytes, residual_bit_depth = _encode_residual(
             photo.original_image, bg_bytes, bg_ext, cfg
         )
+        residual_payload = (r_ext, r_bytes)
+    # Container's stored real-data depth = max across face/region crops AND the
+    # residual. Folding the residual in is what lets a *faceless* high-bit residual
+    # still record settings.bit_depth (so restore writes the right depth). All
+    # 8-bit -> 8 -> no bit_depth key, byte-identical manifest.
+    stored_bit_depth = max(
+        [d for _, _, d in face_enc + region_enc] + [residual_bit_depth]
+    )
 
     payload_size = (
         len(bg_bytes) + len(thumb_bytes)
@@ -397,10 +499,13 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
     )
 
     manifest = {
-        # 1.8.0 added the optional settings.bit_depth key (high-bit crops); 1.7.0
-        # the optional settings.preset key; 1.6.0 the residual layer. Readers are
-        # tolerant by structure, so older readers restore 1.8.0 files unchanged.
-        "version": "1.8.0",
+        # 1.9.0 made the residual layer high-bit too (residual.avif; manifest
+        # bit_depth then covers it); 1.8.0 added settings.bit_depth + high-bit
+        # crops; 1.7.0 the optional preset key; 1.6.0 the residual layer. Readers
+        # are tolerant by structure, so older readers restore 1.9.0 files unchanged
+        # (one that ignores residual.avif just hallucinates the bg, as without a
+        # residual).
+        "version": "1.9.0",
         "mode": "aggressive",
         "original": {
             "filename": photo.original_filename,
@@ -429,9 +534,10 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
             "blend_mode": cfg.blend_mode,
             "model": cfg.model,
             # Residual layer (manifest 1.6.0+). `residual` is the presence flag
-            # for the residual.(jxl|jpg) member (False when the layer is off);
-            # scale/quality describe how it was stored. Readers locate the
-            # member by extension; verify uses the flag to require it.
+            # for the residual.(avif|jxl|jpg) member (False when the layer is off;
+            # avif = the high-bit HDR residual, 1.9.0+); scale/quality describe how
+            # it was stored. Readers locate the member by extension; verify uses
+            # the flag to require it.
             "residual": residual_payload is not None,
             "residual_scale": cfg.residual_scale,
             "residual_quality": cfg.residual_quality,
@@ -477,10 +583,12 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
     if cfg.preset is not None:
         manifest["settings"]["preset"] = cfg.preset
 
-    # Bit depth of the stored real-pixel members (manifest 1.8.0+): present only
-    # when crops/regions went high-bit (10/12-bit AVIF), so an 8-bit container
-    # carries no new key and packs byte-identically to a 1.7.0 file. read_fkeep
-    # uses it to decode those AVIF crops at full depth via avifdec.
+    # Bit depth of the stored high-bit real-data members (manifest 1.8.0+): the max
+    # depth across face/region crops AND (1.9.0+) the residual layer. Present only
+    # when something went high-bit (10/12-bit AVIF), so an 8-bit container carries
+    # no new key and packs byte-identically to a 1.7.0 file. read_fkeep uses it to
+    # decode high-bit AVIF crops at full depth via avifdec; the residual instead
+    # self-describes its depth by its .avif extension.
     if stored_bit_depth > 8:
         manifest["settings"]["bit_depth"] = stored_bit_depth
 
@@ -801,7 +909,10 @@ def verify_fkeep(fkeep_path: str, original_path: Optional[str] = None) -> Verify
                     )
                 else:
                     try:
-                        res = _read_residual(zf, names)
+                        # Structural check only: a high-bit residual.avif decodes
+                        # via Pillow (8-bit) here so verify needs no avifdec —
+                        # mirroring how high-bit avif *crops* are verified.
+                        res = _read_residual(zf, names, avifdec_strict=False)
                     except EncodingError:
                         res = None
                     if res is None:

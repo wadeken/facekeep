@@ -15,7 +15,7 @@ all** (see [Manual recovery](#manual-recovery-without-facekeep)).
 - **Extension:** `.fkeep`
 - **Container:** a ZIP archive (`zipfile.ZIP_DEFLATED`). Anything that opens a
   `.zip` opens a `.fkeep` — just rename it, or point `unzip` straight at it.
-- **Current manifest version:** `1.8.0` (see [Versioning](#versioning--compatibility)).
+- **Current manifest version:** `1.9.0` (see [Versioning](#versioning--compatibility)).
 
 ---
 
@@ -44,7 +44,7 @@ use faithful mode instead, which never discards them.
 > high-frequency delta the downsample lost, so restore adds it back instead of
 > hallucinating — the background becomes faithful-but-lossy (the residual is
 > half-resolution and lossy-encoded, so this is **not** full fidelity), at the
-> cost of a larger `.fkeep`. See the `residual.(jxl|jpg)` member below.
+> cost of a larger `.fkeep`. See the `residual.(avif|jxl|jpg)` member below.
 
 ---
 
@@ -66,7 +66,7 @@ index (`000`, `001`, …) matching the face's `id` in the manifest (and, for the
 | `face_mask_NNN.png` | one per face | 8-bit grayscale PNG | Soft alpha mask for feathered compositing of the crop. |
 | `region_NNN.(jpg\|avif\|jxl\|png)` | one per region (manifest 1.3.0+; only when region-local conservatism fired) | same codec/precedence as face crops | A **region-local conservatism** patch: a near-original-resolution crop of a risky region — the background around a small/distant face, a **hand**, or a **text-like cluster** (signage; opt-in `protect_text`) — kept sharp instead of downsampled. Readers need no new key: a region is a region. Covers the region's `bbox`. |
 | `region_mask_NNN.png` | one per region | 8-bit grayscale PNG | Soft alpha mask for feathered compositing of the region patch. |
-| `residual.jxl` / `residual.jpg` | only when `settings.residual` is true (manifest 1.6.0+) | JPEG XL (q = `settings.residual_quality`); JPEG only as a warned fallback when the JXL plugin is unavailable | The **residual layer**: the real high-frequency delta the background downsample lost, at `settings.residual_scale` resolution, offset-encoded as uint8 (`value/2 + 128` — see [Image members](#image-members-in-detail)). Restore adds it back to a bicubic upscale, so the background is real (lossy) data, not a hallucination. |
+| `residual.avif` / `residual.jxl` / `residual.jpg` | only when `settings.residual` is true (manifest 1.6.0+) | high-bit (10/12-bit) AVIF when `settings.bit_depth` > 8 (manifest 1.9.0+); else JPEG XL (q = `settings.residual_quality`), or JPEG as a warned fallback when the JXL plugin is unavailable | The **residual layer**: the real high-frequency delta the background downsample lost, at `settings.residual_scale` resolution, offset-encoded (`value/2 + 128` into uint8; high-bit: `value/2 + 32768` into uint16 — see [Image members](#image-members-in-detail)). Restore adds it back to a bicubic upscale, so the background is real (lossy) data, not a hallucination. |
 | `exif.bin` | only if the source had EXIF | raw bytes | The original EXIF block, re-embedded into the restored image. |
 | `icc.bin` | only if the source had an ICC profile (manifest 1.4.0+) | raw bytes | The original ICC color profile (e.g. Display P3), re-embedded into the restored image so wide-gamut color survives. |
 
@@ -106,21 +106,27 @@ Notes:
   fired; an older file (or a photo with no risky region) simply has no `region_*`
   members and an empty/absent `regions` array.
 - **At most one residual member** *(1.6.0+)*. When `settings.residual` is true
-  there is exactly one of `residual.jxl` / `residual.jpg`, **located in that
-  order** (JXL is the intended codec — the residual is noise-like content where
-  JXL wins; JPEG appears only as the warned fallback when the JXL plugin was
-  unavailable at compress time). `residual.jxl` decodes with the faithful-mode
-  Pillow plugin, `residual.jpg` with OpenCV — the same split as the other
-  members. Files with `settings.residual` false/absent have no residual member.
-- **High-bit (HDR) crops** *(1.8.0+)*. When `settings.bit_depth` is `10` or `12`,
-  the **real-pixel** members (face crops + region patches) are stored as true
-  high-bit **AVIF** (`face_NNN.avif` / `region_NNN.avif`, via the `avifenc` CLI),
-  so a 10/12-bit HDR source keeps its depth. The background, thumbnail, and
-  residual are **always 8-bit** (the background is hallucinated on restore, so
-  high-bit there buys nothing). Restore decodes these crops at full depth with
-  `avifdec` and writes true HDR only to an `.avif`/`.jxl` output (a JPEG output
-  rounds down, warned). Absent `bit_depth` (the default 8-bit container and all
-  pre-1.8.0 files) means every member is 8-bit, exactly as before.
+  there is exactly one of `residual.avif` / `residual.jxl` / `residual.jpg`,
+  **located in that order**. A high-bit (HDR) residual is a true 10/12-bit
+  `avif` (manifest 1.9.0+, only when high-bit storage is engaged) — its `.avif`
+  extension self-describes the depth. An 8-bit residual is `jxl` (the intended
+  codec — the residual is noise-like content where JXL wins) or `jpg` (the warned
+  fallback when the JXL plugin was unavailable at compress time). `residual.avif`
+  decodes high-bit via `avifdec`, `residual.jxl` with the faithful-mode Pillow
+  plugin, `residual.jpg` with OpenCV. Files with `settings.residual` false/absent
+  have no residual member.
+- **High-bit (HDR) crops + residual** *(1.8.0+ crops; 1.9.0+ residual)*. When
+  `settings.bit_depth` is `10` or `12`, the **real-data** members are stored at
+  true high bit depth via the `avifenc` CLI: the **real-pixel** crops (face crops
+  + region patches, `face_NNN.avif` / `region_NNN.avif`, since 1.8.0) and — when
+  the residual layer is on — the **residual** (`residual.avif`, since 1.9.0), so a
+  10/12-bit HDR source keeps its depth on every real-data member. The
+  **background and thumbnail are always 8-bit** (the background is hallucinated on
+  restore, so high-bit there buys nothing). Restore decodes these members at full
+  depth with `avifdec` and writes true HDR only to an `.avif`/`.jxl` output (a
+  JPEG output rounds down, warned). Absent `bit_depth` (the default 8-bit
+  container and all pre-1.8.0 files) means every member is 8-bit, exactly as
+  before.
 - `thumbnail.jpg` is a convenience preview only; restore ignores it.
 - A well-formed `.fkeep` therefore has `2 + 2·N + 2·R` image members plus the
   manifest (and `+1` each for `exif.bin` / `icc.bin` if the source carried EXIF /
@@ -141,7 +147,7 @@ keys (all present on a v1.1.0 file written by the current code):
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `version` | string | **Manifest schema version** (`"1.8.0"`). Independent of the tool version. |
+| `version` | string | **Manifest schema version** (`"1.9.0"`). Independent of the tool version. |
 | `mode` | string | Always `"aggressive"` (only aggressive mode writes `.fkeep`). |
 | `original` | object | Facts about the original input file — see below. |
 | `exif_preserved` | bool | `true` iff an `exif.bin` member is present. |
@@ -181,10 +187,10 @@ keys (all present on a v1.1.0 file written by the current code):
 | `bg_codec` | string | Codec for the background: `jpg` (default) \| `avif` \| `jxl`. `avif`/`jxl` are stored 4:2:0. *(Added in manifest `1.5.0`; absent on older files, where it is `jpg`.)* Informational — readers locate the background by member extension, not this field. |
 | `face_quality` | int | Quality used for face crops; `>= 100` means crops are lossless PNG (overrides `face_codec`). |
 | `face_codec` | string | Codec for face crops: `jpg` (default) \| `avif` \| `jxl`. `avif`/`jxl` are stored 4:4:4. *(Added in manifest `1.2.0`; absent on older files, where it is `jpg`.)* Informational — readers locate crops by member extension, not this field. |
-| `bit_depth` | int | *(1.8.0+, optional)* Bit depth of the stored **real-pixel** members (face crops + region patches): `10` or `12` when they were stored as true high-bit AVIF (via the `avifenc` CLI, for a 10/12-bit HDR source). **Absent** on the default 8-bit container and all older files — readers treat absent as `8`. The background/thumbnail/residual are always 8-bit. Restore decodes these AVIF crops at full depth (`avifdec`) and writes true HDR only to an avif/jxl output (a JPEG output rounds down, warned). |
+| `bit_depth` | int | *(1.8.0+, optional)* Max bit depth of the stored high-bit **real-data** members: the face crops + region patches (1.8.0+) and — when the residual layer is on — the residual (1.9.0+). `10` or `12` when stored as true high-bit AVIF (via the `avifenc` CLI, for a 10/12-bit HDR source). **Absent** on the default 8-bit container and all older files — readers treat absent as `8`. The background/thumbnail are always 8-bit. Restore decodes high-bit AVIF crops at full depth (`avifdec`) and writes true HDR only to an avif/jxl output (a JPEG output rounds down, warned). |
 | `blend_mode` | string | Soft-mask compositing mode (`gaussian` \| `linear` \| `poisson`). |
 | `model` | string | The super-resolution model name requested for restore (e.g. `realesrgan-x4plus`). |
-| `residual` | bool | *(1.6.0+)* Presence flag for the residual layer: `true` iff a `residual.(jxl\|jpg)` member is present. Restore then reconstructs the background from real data (bicubic + residual) and skips the AI upscale. |
+| `residual` | bool | *(1.6.0+)* Presence flag for the residual layer: `true` iff a `residual.(avif\|jxl\|jpg)` member is present (`avif` = the high-bit HDR residual, 1.9.0+). Restore then reconstructs the background from real data (bicubic + residual) and skips the AI upscale. |
 | `residual_scale` | float | *(1.6.0+)* The resolution the residual was downscaled to before encoding (`0.5` default = half the original per side). Informational — restore resizes the decoded residual to full resolution regardless. |
 | `residual_quality` | int | *(1.6.0+)* Quality (1-100) used for the residual member. |
 | `preset` | string | *(1.7.0+, optional)* The aggressive-mode **preset** (`ratio` \| `pretty` \| `fidelity` \| `family` \| `share`) the file was compressed with. **Absent entirely** on presetless runs and on older files. Informational plus a restore hint: `facekeep restore` auto-applies the preset's *restore-side* knobs (face-enhance backend/fidelity/strength) unless the user explicitly overrode them; an unknown or absent name is simply ignored (tolerant by structure), so a file written by a future preset still restores. |
@@ -227,7 +233,7 @@ A real two-face manifest (values illustrative):
 
 ```json
 {
-  "version": "1.8.0",
+  "version": "1.9.0",
   "mode": "aggressive",
   "original": {
     "filename": "2024.05.20_trip.jpg",
@@ -321,17 +327,23 @@ region. `bg_scale` stays at the aggressive `0.25` for the rest of the frame.
   restore doesn't have to hallucinate it.
 - **`region_mask_NNN.png`** *(1.3.0+)* — the region patch's feathered soft mask,
   identical in form and meaning to `face_mask_NNN.png`.
-- **`residual.(jxl|jpg)`** *(1.6.0+, only when `settings.residual` is true)* —
+- **`residual.(avif|jxl|jpg)`** *(1.6.0+, only when `settings.residual` is true)* —
   the residual layer. At compress time FaceKeep decodes the background member it
   just encoded, bicubic-upscales it back to the original size (`INTER_CUBIC` —
   the same interpolation restore uses, a pinned contract), and computes the
   signed delta `original − upscale`. That delta is downscaled (`INTER_AREA`) to
-  `settings.residual_scale`, **offset-encoded** into uint8 as
-  `clip(round(value/2 + 128), 0, 255)` (halving costs ~1 bit of precision —
-  fine for a correction layer), and encoded as JXL at `residual_quality`
-  (JPEG only as a warned fallback when the JXL plugin is unavailable; located
-  `jxl → jpg`). To turn the stored member back into the signed delta:
-  `value × 2 − 256`.
+  `settings.residual_scale` and **offset-encoded**, then stored:
+  - **8-bit (default):** `clip(round(value/2 + 128), 0, 255)` into uint8 (halving
+    costs ~1 bit of precision — fine for a correction layer), encoded as JXL at
+    `residual_quality` (JPEG only as a warned fallback when the JXL plugin is
+    unavailable; located `jxl → jpg`). Inverse: `value × 2 − 256`.
+  - **High-bit (HDR), 1.9.0+:** when high-bit storage is engaged the original is
+    uint16, so the 8-bit background's bicubic upscale is promoted to the 16-bit
+    scale (`× 257`) before differencing, and the delta is offset-encoded as
+    `clip(round(value/2 + 32768), 0, 65535)` into uint16, stored as a true
+    10/12-bit `residual.avif` (via `avifenc`, 4:4:4). Inverse: `value × 2 −
+    65536`. Restore promotes the upscale to 16-bit and adds the delta, so the
+    background comes back at full depth.
 
 ---
 
@@ -342,9 +354,12 @@ region. `bg_scale` stays at the aggressive `0.25` for the rest of the frame.
 1. Read the manifest; take `original.width/height` and `settings.bg_scale`.
 2. *(1.6.0+, only when a residual member is present)* **Reconstruct the
    background from real data instead**: bicubic-upscale the background member to
-   the original dimensions, decode `residual.(jxl|jpg)`, turn it back into the
-   signed delta (`value × 2 − 256`), resize it to full resolution
-   (`INTER_CUBIC`) and add it on. The background is now **real (lossy) data**,
+   the original dimensions, decode `residual.(avif|jxl|jpg)`, turn it back into
+   the signed delta (`value × 2 − 256`; a high-bit `residual.avif` decodes uint16
+   via `avifdec` with the delta `value × 2 − 65536`, and the upscale is promoted
+   to the 16-bit scale `× 257` first so the result is uint16 HDR), resize it to
+   full resolution (`INTER_CUBIC`) and add it on. The background is now **real
+   (lossy) data**,
    so the AI upscale **and** the GFPGAN background-face step below are skipped —
    both exist to make hallucination plausible, and FaceKeep never replaces real
    pixels with a hallucination. Matched grain (see step 3) still applies; the
@@ -428,13 +443,15 @@ What you can recover by hand, and how good it is:
   back at its `regions[].bbox` over the upscaled background for a sharp result
   there — exactly what restore does, only by hand.
 - **The lost background detail** *(1.6.0+, only if `settings.residual` is
-  true)*. `residual.jxl` (or `.jpg`) is the real high-frequency delta the
-  downsample lost, offset-encoded. By hand: upscale the background member to the
-  original size (bicubic), decode the residual, compute `value × 2 − 256` per
-  pixel (it is stored as `value/2 + 128`), resize that delta to the full size,
-  and add it to the upscaled background — the result is a faithful (if lossy)
-  background, no AI needed. This is exactly what `facekeep restore` does on a
-  residual-bearing file.
+  true)*. `residual.jxl` (or `.jpg`, or a high-bit `residual.avif` since 1.9.0)
+  is the real high-frequency delta the downsample lost, offset-encoded. By hand:
+  upscale the background member to the original size (bicubic), decode the
+  residual, compute `value × 2 − 256` per pixel (it is stored as `value/2 + 128`;
+  for a high-bit `residual.avif` it is uint16 stored as `value/2 + 32768`, so
+  `value × 2 − 65536`, and promote the upscale `× 257` first), resize that delta
+  to the full size, and add it to the upscaled background — the result is a
+  faithful (if lossy) background, no AI needed. This is exactly what `facekeep
+  restore` does on a residual-bearing file.
 - **A quick preview.** `thumbnail.jpg` is an immediate small preview of the
   whole image.
 - **The color profile** *(1.4.0+)*. If the source was wide-gamut, `icc.bin` is the
@@ -469,8 +486,10 @@ decodable `region_NNN.*` **and** `region_mask_NNN.png` exist; that the crop/mask
 counts equal the declared face *and* region counts; that the background is
 non-empty and no larger than the declared original; that every bounding box
 (face and region) is well-formed; and (1.6.0+) that **when `settings.residual`
-declares a residual layer** the `residual.(jxl|jpg)` member is present and
-decodes (a residual-less file is unchanged).
+declares a residual layer** the `residual.(avif|jxl|jpg)` member is present and
+decodes — a high-bit `residual.avif` is decoded with the Pillow plugin here
+(8-bit) purely as a structural check, so `verify` needs no `avifdec` (a
+residual-less file is unchanged).
 
 A file that *opens but is inconsistent* (a missing crop, a count mismatch) is
 reported as a structured list of problems — it is not treated as a crash. Only a
@@ -485,7 +504,7 @@ rather than implying it passed.
 
 ## Versioning & compatibility
 
-- **`version`** is the manifest schema version (currently `1.8.0`) and is
+- **`version`** is the manifest schema version (currently `1.9.0`) and is
   separate from `facekeep_version` (the tool version that wrote the file). Schema
   history: `1.2.0` added `settings.face_codec` (AVIF/JXL face crops); `1.3.0`
   added the `regions[]` array and the `region_NNN.*` / `region_mask_NNN.png`
@@ -504,7 +523,12 @@ rather than implying it passed.
   `settings.bit_depth` key and high-bit (10/12-bit) AVIF face/region crops (an
   HDR source via the `avifenc` CLI — the background stays 8-bit; absent on the
   default 8-bit container and older files, where every member is 8-bit, and a
-  reader that ignores it still restores via the 8-bit Pillow decode).
+  reader that ignores it still restores via the 8-bit Pillow decode); `1.9.0`
+  extended high-bit storage to the **residual layer** (`residual.avif`, via
+  `avifenc`, when the residual is on and high-bit storage is engaged) and widened
+  `settings.bit_depth` to cover it — older files have no `residual.avif` and a
+  reader that ignores it just restores via the normal upscale path (hallucinating
+  the background), exactly as a residual-less file does.
 - Readers are **tolerant by structure, not by strict schema validation**: they
   locate members by name (`background.(jpg|avif|jxl)`, `face_NNN.*`,
   `face_mask_NNN.png`,

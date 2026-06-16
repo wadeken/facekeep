@@ -435,7 +435,7 @@ def test_cli_preset_end_to_end_records_preset(face_image, tmp_path, no_yaml_cwd,
     fkeeps = list(out_dir.glob("*.fkeep"))
     assert len(fkeeps) == 1
     info = read_fkeep_info(str(fkeeps[0]))
-    assert info["version"] == "1.8.0"
+    assert info["version"] == "1.9.0"
     assert info["settings"]["preset"] == "ratio"
     assert info["settings"]["bg_codec"] == "jxl"
     with zipfile.ZipFile(fkeeps[0]) as zf:
@@ -489,7 +489,7 @@ def test_fingerprint_preset_equals_hand_set():
 def test_manifest_records_preset(tmp_path):
     fkeep = _write_fkeep(_preset_cfg("ratio"), tmp_path, "p")
     info = read_fkeep_info(str(fkeep))
-    assert info["version"] == "1.8.0"
+    assert info["version"] == "1.9.0"
     assert info["settings"]["preset"] == "ratio"
 
 

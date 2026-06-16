@@ -840,10 +840,13 @@ def compress_photo(
         region_crops=region_crops,
         region_masks=region_masks,
         regions=regions,
-        # The residual stays 8-bit (the .fkeep residual member is 8-bit): compute
-        # it against the *same* 8-bit ``bg_pixels`` the background was built from
-        # (clean /257 round-down for a uint16 source, ``is image`` for an 8-bit
-        # one), so the residual and the background it corrects agree on the
-        # down-convert.
-        original_image=bg_pixels if cfg.residual else None,
+        # Residual source. 8-bit container (default / non-high-bit): the *same*
+        # 8-bit ``bg_pixels`` the background was built from, so the residual and
+        # the background it corrects agree on the down-convert. High-bit (HDR)
+        # container (``high_bit`` true): the full-depth uint16 ``crop_pixels`` (==
+        # ``image``), so a high-bit residual can reconstruct the background toward
+        # the real uint16 original (format._encode_residual promotes the 8-bit
+        # background to the 16-bit scale to difference against it). Non-high-bit
+        # keeps ``crop_pixels is bg_pixels``, so the 8-bit path is byte-identical.
+        original_image=crop_pixels if cfg.residual else None,
     )

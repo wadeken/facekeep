@@ -378,7 +378,12 @@ restore will actually have (not the pre-encode array, which would make the
 residual fight the bg codec's own loss) and with the same INTER_CUBIC restore
 uses (a pinned contract) — then downscaled to `residual_scale` (0.5 default),
 offset-encoded to uint8 (`value/2 + 128`), and stored as `residual.jxl`
-(manifest 1.6.0; JPEG fallback, warned, if the JXL plugin is absent). On
+(manifest 1.6.0; JPEG fallback, warned, if the JXL plugin is absent). When
+high-bit storage is engaged the residual is instead a true 10/12-bit
+`residual.avif` carrying a uint16 offset (`value/2 + 32768`), so a uint16
+source's background delta keeps its depth too (manifest 1.9.0; the 8-bit
+background's upscale is promoted `× 257` before differencing, and restore
+mirrors that). On
 restore the delta is added back to a plain bicubic upscale, so the background
 is **real (lossy) data** — and the AI upscale **and GFPGAN are skipped** on
 that path: both exist to make hallucination plausible, and repainting real
@@ -415,8 +420,13 @@ fidelity↔ratio trade — high-bit crops are larger, so the `.fkeep` grows — 
 off by default; `output_bit_depth` is output-affecting and feeds
 `settings_fingerprint`, and the stored depth is recorded as the optional
 `settings.bit_depth` manifest key (1.8.0+, absent on an 8-bit container). The
-residual layer is **not** yet high-bit (its offset encoding is 8-bit) — a tracked
-follow-up. *(Aside: implementing this surfaced and fixed a latent R/B-swap bug in
+residual layer is **also high-bit** when it is on (manifest 1.9.0+):
+`residual.avif` stores the background delta at the same 10/12-bit depth via a
+uint16 offset (`value/2 + 32768`), so the residual + high-bit-crops combination —
+aggressive mode's most-faithful path — keeps HDR end to end. It degrades to the
+8-bit residual without `avifenc`, and (offline-first) is skipped at restore on a
+box without `avifdec` (the background then hallucinates, as without a residual).
+*(Aside: implementing this surfaced and fixed a latent R/B-swap bug in
 the shared `avifenc` encode path — `encode_highbit_avif` / `encode_lossless_avif`
 double-applied a BGR→RGB conversion, so faithful mode's 10/12-bit and lossless
 AVIF output had red/blue exchanged; now pinned by a color round-trip test.)*
