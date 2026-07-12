@@ -10,10 +10,11 @@ import io
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import cv2
 import numpy as np
@@ -514,6 +515,246 @@ def encode_gainmap_avif(
         return Path(out_avif).read_bytes()
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# JPEG-with-gain-map output — Ultra HDR (ROADMAP 9.3).
+#
+# Unlike the AVIF path above this needs NO external binary: the primary JPEG is
+# a normal Pillow encode (EXIF + a real ICC profile — no CICP approximation),
+# and the MPF/XMP framing is assembled by hand. Hand-built for a measured
+# reason (spike 9.3.0): Pillow's own MPO saver mis-patches the MPF offsets as
+# soon as the primary carries an icc_profile/xmp kwarg (it only accounts for
+# EXIF), so it cannot author this file. The flavor is full Google Ultra HDR —
+# a GContainer directory + hdrgm:Version on the *primary* frame plus Adobe
+# hdrgm metadata on the gain-map frame — because the user-validated HDR render
+# test showed Chrome keys on the primary XMP (MPF + a gain-map-frame XMP alone
+# is NOT treated as HDR), and the Apple flavor carries maker-note semantics we
+# should not fabricate. NOTE: current Pillow deliberately refuses to open Ultra
+# HDR files as MPO ("not yet supported" sniff on ` hdrgm:Version="`), which is
+# why imageio._read_jpeg_gain_map has its own MPF-index fallback for reading
+# these files (and real Pixel Ultra HDR JPEGs) back.
+
+_JPEG_XMP_NS = b"http://ns.adobe.com/xap/1.0/\x00"
+
+
+def _hdrgm_xmp(headroom: float) -> bytes:
+    """Adobe hdrgm XMP packet for the gain-map frame.
+
+    The values mirror the 9.2-validated Apple semantics ``boost =
+    2^(headroom * v/255)`` exactly: with ``Gamma=1``, ``GainMapMin=0``,
+    ``GainMapMax=headroom`` and zero offsets, the hdrgm application formula
+    reduces to the same expression — so the stored gain-map pixels ride
+    value-for-value, no resampling or math.
+    """
+    h = float(headroom)
+    return (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        ' xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"'
+        ' hdrgm:Version="1.0"'
+        f' hdrgm:GainMapMin="0.0" hdrgm:GainMapMax="{h}"'
+        ' hdrgm:Gamma="1.0"'
+        ' hdrgm:OffsetSDR="0.0" hdrgm:OffsetHDR="0.0"'
+        f' hdrgm:HDRCapacityMin="0.0" hdrgm:HDRCapacityMax="{h}"'
+        ' hdrgm:BaseRenditionIsHDR="False"/>'
+        "</rdf:RDF></x:xmpmeta>"
+    ).encode()
+
+
+def _ultrahdr_primary_xmp(gain_map_len: int) -> bytes:
+    """Google Ultra HDR GContainer directory for the primary frame.
+
+    ``gain_map_len`` is the byte length of the complete gain-map JPEG appended
+    after the primary (``Item:Length``) — how Ultra HDR readers locate it.
+    """
+    return (
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+        '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+        '<rdf:Description rdf:about=""'
+        ' xmlns:Container="http://ns.google.com/photos/1.0/container/"'
+        ' xmlns:Item="http://ns.google.com/photos/1.0/container/item/"'
+        ' xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"'
+        ' hdrgm:Version="1.0">'
+        "<Container:Directory><rdf:Seq>"
+        '<rdf:li rdf:parseType="Resource">'
+        '<Container:Item Item:Semantic="Primary" Item:Mime="image/jpeg"/>'
+        "</rdf:li>"
+        '<rdf:li rdf:parseType="Resource">'
+        '<Container:Item Item:Semantic="GainMap" Item:Mime="image/jpeg"'
+        f' Item:Length="{gain_map_len}"/>'
+        "</rdf:li>"
+        "</rdf:Seq></Container:Directory>"
+        "</rdf:Description></rdf:RDF></x:xmpmeta>"
+    ).encode()
+
+
+def _jpeg_xmp_app1(packet: bytes) -> bytes:
+    """Wrap an XMP packet in a standard JPEG APP1 segment."""
+    payload = _JPEG_XMP_NS + packet
+    if 2 + len(payload) > 0xFFFF:
+        raise EncodingError("XMP packet too large for a JPEG APP1 segment.")
+    return b"\xff\xe1" + struct.pack(">H", 2 + len(payload)) + payload
+
+
+def _jpeg_leading_app_end(data: bytes) -> tuple:
+    """Return ``(end_of_leading_APP0/APP1_run, end_of_last_APP1)`` offsets.
+
+    The XMP APP1 is spliced after the last APP1 (right after Pillow's EXIF
+    APP1) and the MPF APP2 immediately after it — matching Apple's own segment
+    order (Exif -> XMP -> MPF -> ICC), with the MPF ahead of any multi-segment
+    ICC as CIPA DC-007 recommends.
+    """
+    if data[:2] != b"\xff\xd8":
+        raise EncodingError("Not a JPEG (missing SOI marker).")
+    pos = 2
+    end_apps = 2
+    end_app1 = 2
+    while pos + 4 <= len(data) and data[pos] == 0xFF:
+        marker = data[pos + 1]
+        if marker not in (0xE0, 0xE1):
+            break
+        seglen = struct.unpack(">H", data[pos + 2:pos + 4])[0]
+        pos += 2 + seglen
+        end_apps = pos
+        if marker == 0xE1:
+            end_app1 = pos
+    return end_apps, end_app1
+
+
+# The hand-built MPF APP2 is fixed-size: marker(2) + length(2) + "MPF\0"(4) +
+# TIFF(82) = 90 bytes. TIFF: II header(8) + entry count(2) + 3 IFD entries(36)
+# + next-IFD(4) + 2 MP entries(16 each) — the same layout Pillow's own MPO
+# writer emits, so its parser (and every MPF reader) accepts it.
+_MPF_SEG_LEN = 90
+
+
+def _mpf_app2(primary_total: int, tiff_abs: int, gain_map_len: int) -> bytes:
+    """Build the MPF APP2 index segment (CIPA DC-007, little-endian).
+
+    Per the spec, MP entry data offsets are relative to the MP Endian field
+    (the TIFF header inside the APP2, at absolute offset ``tiff_abs``); the
+    primary image's own offset is 0 by convention. Verified value-for-value
+    against a real iPhone HDR JPEG's MPF in the 9.3.0 spike.
+    """
+    entries = struct.pack("<LLLHH", 0x030000, primary_total, 0, 0, 0)
+    entries += struct.pack(
+        "<LLLHH", 0x000000, gain_map_len, primary_total - tiff_abs, 0, 0
+    )
+    ifd = struct.pack("<H", 3)
+    ifd += struct.pack("<HHL4s", 0xB000, 7, 4, b"0100")  # MPFVersion
+    ifd += struct.pack("<HHLL", 0xB001, 4, 1, 2)  # NumberOfImages
+    ifd += struct.pack("<HHLL", 0xB002, 7, 32, 50)  # MPEntry data at tiff+50
+    ifd += struct.pack("<L", 0)  # no next IFD
+    tiff = b"II" + struct.pack("<HL", 0x2A, 8) + ifd + entries
+    seg = b"\xff\xe2" + struct.pack(">H", 2 + 4 + len(tiff)) + b"MPF\0" + tiff
+    assert len(seg) == _MPF_SEG_LEN
+    return seg
+
+
+def encode_gainmap_jpeg(
+    image_bgr: np.ndarray,
+    gain_map: Union[np.ndarray, bytes, bytearray],
+    *,
+    headroom: float = 3.0,
+    quality: int = 95,
+    exif: Optional[bytes] = None,
+    icc: Optional[bytes] = None,
+) -> bytes:
+    """Encode a BGR image + HDR gain map to an Ultra HDR JPEG (pure Pillow).
+
+    Produces a **backward-compatible HDR JPEG** — the maximum-compatibility
+    HDR output: SDR viewers decode a completely ordinary JPEG (the primary
+    frame, byte-identical pixels to the plain SDR write at the same quality);
+    gain-map-aware viewers (Chrome/Android "Ultra HDR", Apple software) find
+    the gain map via the MPF index + the GContainer/hdrgm XMP and extend the
+    highlights — the same mechanism as the source iPhone photo.
+
+    Unlike :func:`encode_gainmap_avif` there is **no external binary and no
+    pixel math**: the gain map rides value-for-value as the MPF second frame
+    (its Apple semantics ``boost = 2^(headroom * v/255)`` map exactly onto the
+    Adobe hdrgm metadata written here), and the source ICC profile (e.g.
+    Display P3) is embedded as a *real* profile on the primary.
+
+    Args:
+        image_bgr: The restored base image, uint8 BGR (a uint16 input is
+            rounded down — the gain-map HDR mechanism is an 8-bit base by
+            construction).
+        gain_map: The stored gain map. Preferred: the raw JPEG bytes of the
+            ``.fkeep``'s ``gainmap.jpg`` member, reused **verbatim** (zero
+            re-encode, no generation loss). A decoded 2-D uint8 array is also
+            accepted and re-encoded as grayscale JPEG q90 (the member's own
+            settings).
+        headroom: HDR headroom in stops (``aggressive.gain_map_headroom``) —
+            written into the hdrgm metadata, never applied to pixels.
+        quality: JPEG quality for the primary frame.
+        exif: Optional EXIF bytes for the primary frame.
+        icc: Optional ICC profile bytes for the primary frame.
+
+    Returns:
+        Complete Ultra HDR JPEG bytes (primary + spliced XMP/MPF + gain map).
+
+    Raises:
+        EncodingError: on malformed inputs or an encode failure. Callers
+            (aggressive restore) catch this and fall back to the plain SDR
+            JPEG write, warned.
+    """
+    if isinstance(gain_map, (bytes, bytearray)):
+        gm_jpeg = bytes(gain_map)
+        if gm_jpeg[:2] != b"\xff\xd8":
+            raise EncodingError("gain_map bytes are not a JPEG (missing SOI).")
+    else:
+        gm = np.asarray(gain_map)
+        if gm.dtype != np.uint8:
+            gm = np.clip(gm, 0, 255).astype(np.uint8)
+        ok, buf = cv2.imencode(".jpg", gm, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            raise EncodingError("Failed to encode the gain map as JPEG.")
+        gm_jpeg = buf.tobytes()
+
+    if image_bgr.dtype == np.uint16:
+        image_bgr = np.round(image_bgr.astype(np.float32) / 257.0).astype(np.uint8)
+    elif image_bgr.dtype != np.uint8:
+        image_bgr = np.clip(image_bgr, 0, 255).astype(np.uint8)
+
+    # Primary frame: a normal Pillow JPEG encode carrying EXIF and the real
+    # ICC profile — identical parameters to the plain SDR restore write, so
+    # the SDR rendition of this file is the SDR output. BGR->RGB at the PIL
+    # boundary per the repo rule.
+    buf = io.BytesIO()
+    pil = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+    save_kwargs = {"quality": quality}
+    if icc:
+        save_kwargs["icc_profile"] = icc
+    if exif:
+        save_kwargs["exif"] = exif
+    try:
+        pil.save(buf, "JPEG", **save_kwargs)
+    except (ValueError, struct.error, OSError) as e:
+        raise EncodingError(f"Primary JPEG encode failed: {e}") from e
+    finally:
+        pil.close()
+    primary = buf.getvalue()
+
+    # Gain-map frame: splice the hdrgm XMP APP1 into the stored JPEG bytes.
+    gm_apps, _ = _jpeg_leading_app_end(gm_jpeg)
+    gm_frame = (
+        gm_jpeg[:gm_apps] + _jpeg_xmp_app1(_hdrgm_xmp(headroom))
+        + gm_jpeg[gm_apps:]
+    )
+
+    # Primary frame: splice the GContainer XMP after the EXIF APP1, then the
+    # MPF APP2 right after it (Item:Length is known — the frame is built).
+    _, app1_end = _jpeg_leading_app_end(primary)
+    xmp_seg = _jpeg_xmp_app1(_ultrahdr_primary_xmp(len(gm_frame)))
+    primary = primary[:app1_end] + xmp_seg + primary[app1_end:]
+    mpf_at = app1_end + len(xmp_seg)
+    primary_total = len(primary) + _MPF_SEG_LEN
+    tiff_abs = mpf_at + 8  # marker(2) + length(2) + "MPF\0"(4)
+    mpf = _mpf_app2(primary_total, tiff_abs, len(gm_frame))
+    primary = primary[:mpf_at] + mpf + primary[mpf_at:]
+    return primary + gm_frame
 
 
 def encode_lossless_avif(

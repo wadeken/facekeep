@@ -5,8 +5,10 @@ Compress stores the gain map ``imageio.load`` extracted (9.1) as a
 1.10.0); ``verify_fkeep`` requires a *declared* gain map to decode; restore
 re-attaches it into a backward-compatible HDR AVIF via the external
 ``avifgainmaputil`` binary when the output is ``.avif`` and the binary is
-locatable — every other combination falls back to the normal SDR write with a
-warning (offline-first, never a hard fail).
+locatable, or (ROADMAP 9.3) into an **Ultra HDR JPEG** via pure Pillow when
+the output is ``.jpg``/``.jpeg`` (the default — no binary needed) — every
+other combination falls back to the normal SDR write with a warning
+(offline-first, never a hard fail).
 
 Gating mirrors the high-bit tests: the real HDR re-attach test skips unless
 ``avifgainmaputil`` is locatable (set ``FACEKEEP_AVIFENC`` — the sibling lookup
@@ -214,8 +216,12 @@ def test_faithful_fingerprint_ignores_gain_map_fields():
 # ---------------------------------------------------------------- restore side
 
 
-def test_restore_jpg_warns_and_writes_sdr(hdr_jpeg, tmp_path, caplog):
-    """A non-avif output cannot carry the gain map: SDR + a warning."""
+def test_restore_jpg_carries_gain_map(hdr_jpeg, tmp_path, caplog):
+    """The default .jpg restore output is an Ultra HDR JPEG (ROADMAP 9.3):
+    the gain map rides as the MPF second frame, no warning, and FaceKeep's own
+    loader re-extracts it (self-round-trip)."""
+    from facekeep import imageio
+
     fkeep = _compress_to_fkeep(hdr_jpeg, tmp_path)
     out = tmp_path / "restored.jpg"
 
@@ -223,7 +229,56 @@ def test_restore_jpg_warns_and_writes_sdr(hdr_jpeg, tmp_path, caplog):
         Restorer(FaceKeepConfig().aggressive).restore(str(fkeep), str(out))
 
     assert out.exists() and out.stat().st_size > 0
+    assert not any("gain map" in r.message.lower() for r in caplog.records)
+    loaded = imageio.load(str(out))
+    assert loaded.gain_map is not None
+    assert loaded.gain_map_meta["source"] == "jpeg-mpf"
+    # The stored member bytes ride verbatim, so the values match read_fkeep's
+    # decode of gainmap.jpg exactly (same JPEG, decoded twice).
+    stored = read_fkeep(str(fkeep))["gain_map"]
+    gm = loaded.gain_map
+    assert gm.shape == stored.shape
+    assert np.array_equal(gm, stored)
+    # The full Ultra HDR flavor: hdrgm + GContainer on the primary (what the
+    # user-validated Chrome render keys on).
+    raw = out.read_bytes()
+    assert b'hdrgm:Version="1.0"' in raw
+    assert b"Item:Semantic=\"GainMap\"" in raw
+
+
+def test_restore_png_warns_and_writes_sdr(hdr_jpeg, tmp_path, caplog):
+    """A format that can't carry the gain map (.png) still warns + writes SDR."""
+    fkeep = _compress_to_fkeep(hdr_jpeg, tmp_path)
+    out = tmp_path / "restored.png"
+
+    with caplog.at_level("WARNING", logger="facekeep.aggressive.restorer"):
+        Restorer(FaceKeepConfig().aggressive).restore(str(fkeep), str(out))
+
+    assert out.exists() and out.stat().st_size > 0
     assert any("gain map" in r.message.lower() for r in caplog.records)
+
+
+def test_restore_jpg_authoring_failure_falls_back_sdr(
+    hdr_jpeg, tmp_path, caplog, monkeypatch
+):
+    """An Ultra HDR authoring failure degrades to the plain SDR JPEG write."""
+    fkeep = _compress_to_fkeep(hdr_jpeg, tmp_path)
+    out = tmp_path / "restored.jpg"
+
+    def boom(*a, **k):
+        raise EncodingError("synthetic authoring failure")
+
+    monkeypatch.setattr(encoders, "encode_gainmap_jpeg", boom)
+    with caplog.at_level("WARNING", logger="facekeep.aggressive.restorer"):
+        Restorer(FaceKeepConfig().aggressive).restore(str(fkeep), str(out))
+
+    assert out.exists() and out.stat().st_size > 0
+    assert any("gain-map JPEG authoring failed" in r.message
+               for r in caplog.records)
+    # The fallback is a plain SDR JPEG: no MPF second frame.
+    with Image.open(out) as pil:
+        assert pil.format == "JPEG"
+        assert getattr(pil, "n_frames", 1) == 1
 
 
 def test_restore_avif_without_binary_falls_back_sdr(

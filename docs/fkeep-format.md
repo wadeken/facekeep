@@ -67,7 +67,7 @@ index (`000`, `001`, …) matching the face's `id` in the manifest (and, for the
 | `region_NNN.(jpg\|avif\|jxl\|png)` | one per region (manifest 1.3.0+; only when region-local conservatism fired) | same codec/precedence as face crops | A **region-local conservatism** patch: a near-original-resolution crop of a risky region — the background around a small/distant face, a **hand**, or a **text-like cluster** (signage; opt-in `protect_text`) — kept sharp instead of downsampled. Readers need no new key: a region is a region. Covers the region's `bbox`. |
 | `region_mask_NNN.png` | one per region | 8-bit grayscale PNG | Soft alpha mask for feathered compositing of the region patch. |
 | `residual.avif` / `residual.jxl` / `residual.jpg` | only when `settings.residual` is true (manifest 1.6.0+) | high-bit (10/12-bit) AVIF when `settings.bit_depth` > 8 (manifest 1.9.0+); else JPEG XL (q = `settings.residual_quality`), or JPEG as a warned fallback when the JXL plugin is unavailable | The **residual layer**: the real high-frequency delta the background downsample lost, at `settings.residual_scale` resolution, offset-encoded (`value/2 + 128` into uint8; high-bit: `value/2 + 32768` into uint16 — see [Image members](#image-members-in-detail)). Restore adds it back to a bicubic upscale, so the background is real (lossy) data, not a hallucination. |
-| `gainmap.jpg` | only when `gain_map_preserved` is true (manifest 1.10.0+) | grayscale JPEG q90 (typically half the original resolution) | The source's **iPhone HDR gain map** (the auxiliary image that makes an iPhone photo HDR — the base image is plain 8-bit SDR). Stored upright (aligned with the original frame). `facekeep restore -f avif` re-attaches it via `avifgainmaputil combine` into a backward-compatible **HDR AVIF**; any other output (or a machine without the binary) restores SDR with a warning. |
+| `gainmap.jpg` | only when `gain_map_preserved` is true (manifest 1.10.0+) | grayscale JPEG q90 (typically half the original resolution) | The source's **iPhone HDR gain map** (the auxiliary image that makes an iPhone photo HDR — the base image is plain 8-bit SDR). Stored upright (aligned with the original frame). `facekeep restore` re-attaches it on the HDR-capable outputs: the **default `.jpg`** becomes a backward-compatible **Ultra HDR JPEG** (built in, pure Pillow — the stored bytes ride verbatim as the MPF second frame), and `-f avif` becomes an **HDR AVIF** via `avifgainmaputil combine`; any other output (or a machine without the binary, on the AVIF path) restores SDR with a warning. |
 | `exif.bin` | only if the source had EXIF | raw bytes | The original EXIF block, re-embedded into the restored image. |
 | `icc.bin` | only if the source had an ICC profile (manifest 1.4.0+) | raw bytes | The original ICC color profile (e.g. Display P3), re-embedded into the restored image so wide-gamut color survives. |
 
@@ -423,20 +423,35 @@ region. `bg_scale` stays at the aggressive `0.25` for the rest of the frame.
    opens anywhere. Point `restore` at a folder to un-fkeep a whole library at once.)
    *Note: AVIF carries the ICC bytes verbatim; JXL re-serializes the profile from
    its internal color model (still a valid embedded profile, just not byte-identical).*
-7. *(1.10.0+, only when a `gainmap.jpg` member is present and the output is
-   `.avif`)* **Re-attach the HDR gain map.** The restored base is linearized,
-   boosted per pixel by `2^(headroom × gain)` (headroom =
-   `aggressive.gain_map_headroom`, default 3 stops), PQ-encoded into an HDR
-   alternate, and `avifgainmaputil combine` writes a **backward-compatible HDR
-   AVIF**: SDR viewers show the base, HDR displays extend the highlights — the
-   same mechanism as the original iPhone photo. EXIF rides along; color is
-   declared via CICP (Display P3 → primaries 12) because the tool does not
-   accept ICC-profiled inputs — equivalent for P3/sRGB sources, which is every
-   iPhone. A non-`.avif` output, a machine without the `avifgainmaputil`
-   binary, or any re-attach failure falls back to the normal SDR write above
-   with a warning (offline-first; never a hard fail). The aggressive caveat
-   applies honestly: the background under the gain map is reconstructed, so its
-   HDR is approximate — the faces/patches are real pixels with real HDR boost.
+7. *(1.10.0+, only when a `gainmap.jpg` member is present)* **Re-attach the
+   HDR gain map.** Two output formats can carry it; both are
+   backward-compatible (SDR viewers show the base, HDR displays extend the
+   highlights — the same mechanism as the original iPhone photo):
+   - **`.jpg`/`.jpeg` (the default output; since 9.3):** the restore writes an
+     **Ultra HDR JPEG** with no external tool — the primary frame is the
+     normal SDR encode (EXIF + the real ICC profile embedded), the stored
+     `gainmap.jpg` bytes ride **verbatim** as the MPF second frame (zero
+     re-encode), and the standard Ultra HDR metadata is written around them:
+     a GContainer directory + `hdrgm:Version` XMP on the primary, Adobe
+     `hdrgm` parameters on the gain-map frame (`Gamma=1, GainMapMin=0,
+     GainMapMax=headroom`, zero offsets — exactly equivalent to the Apple
+     `2^(headroom × value/255)` semantics, so the map is carried
+     value-for-value), and a hand-built MPF APP2 index. Any authoring failure
+     falls back to the plain SDR JPEG write with a warning.
+   - **`.avif` (`restore -f avif`):** the restored base is linearized, boosted
+     per pixel by `2^(headroom × gain)` (headroom =
+     `aggressive.gain_map_headroom`, default 3 stops), PQ-encoded into an HDR
+     alternate, and `avifgainmaputil combine` writes an **HDR AVIF**. EXIF
+     rides along; color is declared via CICP (Display P3 → primaries 12)
+     because the tool does not accept ICC-profiled inputs — equivalent for
+     P3/sRGB sources, which is every iPhone. A machine without the
+     `avifgainmaputil` binary, or any re-attach failure, falls back to the
+     normal SDR write above with a warning (offline-first; never a hard fail).
+
+   Other outputs (`.jxl`/`.png`/`.webp`) cannot carry the map and restore SDR
+   with a warning. The aggressive caveat applies honestly to both HDR paths:
+   the background under the gain map is reconstructed, so its HDR is
+   approximate — the faces/patches are real pixels with real HDR boost.
 
 The result is full-resolution: **real face pixels** over a **reconstructed
 background**. The seam between them is hidden by the soft mask.
@@ -491,8 +506,9 @@ What you can recover by hand, and how good it is:
   photo — a plain grayscale JPEG any viewer opens. By hand: brighten the
   recovered image per pixel by `2^(3 × value/255)` in linear light for the
   full HDR rendition, or hand the base + map to any gain-map-aware tool
-  (e.g. libavif's `avifgainmaputil combine`) — exactly what `facekeep restore
-  -f avif` does.
+  (e.g. libavif's `avifgainmaputil combine`, or any Ultra HDR writer) —
+  exactly what `facekeep restore` does (`-f avif`, or the default `.jpg`
+  which packages base + map as an Ultra HDR JPEG).
 - **A quick preview.** `thumbnail.jpg` is an immediate small preview of the
   whole image.
 - **The color profile** *(1.4.0+)*. If the source was wide-gamut, `icc.bin` is the

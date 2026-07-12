@@ -11,9 +11,11 @@ modern iPhone HDR still is an 8-bit Display-P3 base plus an Apple gain map
 (HEIC: the ``…aux:hdrgainmap`` auxiliary image; JPEG: an MPF second frame whose
 XMP names the gain map), *not* a 10/12-bit deep-color image. The gain map is
 extracted best-effort onto ``LoadedImage.gain_map`` so downstream stages can
-preserve it; nothing consumes it yet, so loading alone changes no output.
+preserve it (aggressive mode stores it in the ``.fkeep`` and restore
+re-attaches it — 9.2 AVIF, 9.3 Ultra HDR JPEG).
 """
 
+import io
 import logging
 import struct
 from dataclasses import dataclass
@@ -254,6 +256,60 @@ def _read_heif_gain_map(himg) -> tuple[Optional[np.ndarray], Optional[dict]]:
     return None, None
 
 
+def _parse_mpf_index(mp: bytes) -> list:
+    """Parse a raw MPF APP2 TIFF (Pillow's ``info["mp"]``) into MP entries.
+
+    Returns ``[(size, data_offset), ...]`` per image (offsets relative to the
+    MP Endian field, per CIPA DC-007 — the primary's is 0 by convention), or
+    ``[]`` when the structure doesn't parse. Handles both endiannesses (Apple
+    writes MM, Pillow/FaceKeep write II).
+    """
+    try:
+        endian = {b"II": "<", b"MM": ">"}.get(mp[:2])
+        if endian is None or struct.unpack_from(endian + "H", mp, 2)[0] != 0x2A:
+            return []
+        (ifd_off,) = struct.unpack_from(endian + "L", mp, 4)
+        (count,) = struct.unpack_from(endian + "H", mp, ifd_off)
+        n_images = 0
+        entry_blob = b""
+        for i in range(count):
+            base = ifd_off + 2 + 12 * i
+            tag, typ, cnt = struct.unpack_from(endian + "HHL", mp, base)
+            if tag == 0xB001:
+                (n_images,) = struct.unpack_from(endian + "L", mp, base + 8)
+            elif tag == 0xB002 and cnt > 4:
+                (data_off,) = struct.unpack_from(endian + "L", mp, base + 8)
+                entry_blob = mp[data_off:data_off + cnt]
+        if n_images < 2 or len(entry_blob) < 16 * n_images:
+            return []
+        entries = []
+        for i in range(n_images):
+            _attr, size, off = struct.unpack_from(endian + "LLL", entry_blob, 16 * i)
+            entries.append((size, off))
+        return entries
+    except struct.error:
+        return []
+
+
+def _gain_map_from_frame(frame_bytes: bytes, frame_index: int):
+    """Decode one standalone MPF frame; return ``(arr, meta)`` iff its XMP
+    names a gain map (``_GAIN_MAP_XMP_MARKERS``), else ``(None, None)``."""
+    from PIL import Image
+
+    with Image.open(io.BytesIO(frame_bytes)) as pil:
+        xmp = pil.info.get("xmp") or b""
+        if isinstance(xmp, str):
+            xmp = xmp.encode("utf-8", "ignore")
+        low = bytes(xmp).lower()
+        if not any(marker in low for marker in _GAIN_MAP_XMP_MARKERS):
+            return None, None
+        arr = np.asarray(pil)
+    if arr.ndim == 3:  # typically mode "L" (2-D); normalize to BGR
+        arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    meta = {"source": "jpeg-mpf", "frame_index": frame_index, "xmp": bytes(xmp)}
+    return arr, meta
+
+
 def _read_jpeg_gain_map(path: Path) -> tuple[Optional[np.ndarray], Optional[dict]]:
     """Extract the HDR gain map from a JPEG's MPF second frame, if any.
 
@@ -265,25 +321,53 @@ def _read_jpeg_gain_map(path: Path) -> tuple[Optional[np.ndarray], Optional[dict
     ``load()`` rotates it together with the base image (the MPF frame is stored
     un-rotated exactly like the base pixels). Best-effort: any failure yields
     ``(None, None)``.
+
+    **Ultra HDR fallback (ROADMAP 9.3):** current Pillow deliberately refuses
+    to open an Ultra HDR JPEG as MPO (it sniffs ``hdrgm:Version`` in a primary
+    APP1 — "not yet supported"), yet those files — FaceKeep's own
+    ``encode_gainmap_jpeg`` restore output, and real Pixel/Android photos —
+    carry the gain map in exactly the same MPF frame. So when Pillow yields a
+    plain JPEG that still has an MPF APP2 (``info["mp"]``), the MP index is
+    parsed here directly and the secondary frames are sliced/decoded standalone
+    (same XMP acceptance rule).
     """
     try:
         from PIL import Image
 
         with Image.open(str(path)) as pil:
-            if pil.format != "MPO" or getattr(pil, "n_frames", 1) < 2:
+            if pil.format == "MPO" and getattr(pil, "n_frames", 1) >= 2:
+                for frame in range(1, pil.n_frames):
+                    pil.seek(frame)
+                    xmp = pil.info.get("xmp") or b""
+                    if isinstance(xmp, str):
+                        xmp = xmp.encode("utf-8", "ignore")
+                    low = bytes(xmp).lower()
+                    if not any(m in low for m in _GAIN_MAP_XMP_MARKERS):
+                        continue
+                    arr = np.asarray(pil)
+                    if arr.ndim == 3:  # mode "L" is 2-D; normalize to BGR
+                        arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                    meta = {"source": "jpeg-mpf", "frame_index": frame,
+                            "xmp": bytes(xmp)}
+                    return arr, meta
                 return None, None
-            for frame in range(1, pil.n_frames):
-                pil.seek(frame)
-                xmp = pil.info.get("xmp") or b""
-                if isinstance(xmp, str):
-                    xmp = xmp.encode("utf-8", "ignore")
-                low = bytes(xmp).lower()
-                if not any(marker in low for marker in _GAIN_MAP_XMP_MARKERS):
-                    continue
-                arr = np.asarray(pil)
-                if arr.ndim == 3:  # typically mode "L" (2-D); normalize to BGR
-                    arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
-                meta = {"source": "jpeg-mpf", "frame_index": frame, "xmp": bytes(xmp)}
+
+            # Ultra HDR fallback: a plain JPEG that still carries an MPF APP2.
+            mp = pil.info.get("mp")
+            mp_abs = pil.info.get("mpoffset")
+            if pil.format != "JPEG" or not mp or not mp_abs:
+                return None, None
+        entries = _parse_mpf_index(bytes(mp))
+        if len(entries) < 2:
+            return None, None
+        data = path.read_bytes()
+        for frame, (size, off) in enumerate(entries[1:], start=1):
+            start = mp_abs + off
+            frame_bytes = data[start:start + size]
+            if frame_bytes[:2] != b"\xff\xd8":
+                continue
+            arr, meta = _gain_map_from_frame(frame_bytes, frame)
+            if arr is not None:
                 return arr, meta
     except (OSError, ValueError, EOFError, struct.error, KeyError) as e:
         logger.debug("No gain map read for %s (%s)", path.name, e)

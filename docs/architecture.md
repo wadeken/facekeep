@@ -133,10 +133,13 @@ restore: .fkeep → AI super-resolution upscale background (Real-ESRGAN;
                   feathered soft masks → full-resolution standard image (.jpg
                   default via Pillow, or .avif/.jxl; EXIF *and* ICC color profile
                   re-embedded) — so a .fkeep is never a dead end
-                  → (1.10.0+, .avif output only) re-attach the stored iPhone HDR
-                  gain map via avifgainmaputil combine → a backward-compatible
-                  HDR AVIF (SDR viewers see the base; missing binary/other
-                  formats → SDR + warn)
+                  → (1.10.0+) re-attach the stored iPhone HDR gain map:
+                  a .jpg output (the default) becomes an Ultra HDR JPEG
+                  (built in, pure Pillow — the stored map rides verbatim as
+                  the MPF second frame); a .avif output goes via
+                  avifgainmaputil combine → a backward-compatible HDR file
+                  either way (SDR viewers see the base; missing binary /
+                  other formats → SDR + warn)
 
          (residual files, 1.6.0+: the background is instead reconstructed from
           REAL data — bicubic upscale + the stored residual delta — and the AI
@@ -445,25 +448,46 @@ extracts that gain map (HEIC aux image / JPEG MPF second frame,
 XMP-discriminated); aggressive compress stores it as one small `gainmap.jpg`
 member (grayscale, typically half-resolution — Apple's own native scale) plus a
 `gain_map_preserved` manifest flag, automatically whenever the source carries
-one (the "just preserve it" decision; the flag opts out). On `restore -f avif`
-the gain map is **re-attached**: the restored base is linearized, boosted per
-pixel by `2^(headroom × gain)` (`aggressive.gain_map_headroom`, default 3 stops
-— validated value-for-value against libavif's own conversion of a real iPhone
-photo), PQ-encoded into an HDR alternate, and `avifgainmaputil combine` writes
-a **backward-compatible HDR AVIF** (SDR viewers show the base; HDR displays
-extend the highlights — the same mechanism as the original photo). Graceful
-degradation everywhere (principle 4): a non-`.avif` output, a machine without
-the `avifgainmaputil` binary (the same opt-in `.tools`/PATH family as
-`avifenc`), or any re-attach failure falls back to the normal SDR write with a
-warning — never a hard fail, and `preview()` never re-attaches (an external
-re-encode is too slow for interactive use, and preview *pixels* are identical
-either way). Two honest limits, documented in the format spec: the tool
-rejects ICC-profiled inputs, so output color is declared via CICP (equivalent
-for the P3/sRGB profiles every iPhone uses); and the background under the gain
-map is reconstructed, so its HDR is approximate — the faces/patches are real
-pixels with real HDR boost, the same "plausible, not faithful" bargain the mode
-already makes. `preserve_gain_map` is compress-side → fingerprinted;
-`gain_map_headroom` is restore-only → not.
+one (the "just preserve it" decision; the flag opts out). On restore the gain
+map is **re-attached** into a backward-compatible HDR output (SDR viewers show
+the base; HDR displays extend the highlights — the same mechanism as the
+original photo), by two paths:
+
+- **The default `.jpg` output → an Ultra HDR JPEG (9.3), built in.** Pure
+  Pillow plus a hand-assembled MPF index — no external binary, so the default
+  restore is HDR on a fresh offline machine. The primary frame is the normal
+  SDR encode (EXIF + the *real* ICC profile — better than the AVIF path's CICP
+  approximation), and the stored `gainmap.jpg` bytes ride **verbatim** as the
+  MPF second frame (zero re-encode); the standard Ultra HDR metadata written
+  around them (GContainer directory + `hdrgm:Version` on the primary, Adobe
+  hdrgm parameters on the frame — `Gamma=1, Min=0, Max=headroom`, zero
+  offsets) is *exactly* equivalent to the Apple `2^(headroom × v/255)`
+  semantics, so no pixel math happens at all. The flavor was picked by a real
+  HDR-display render test (Chrome keys on the primary's GContainer/hdrgm XMP;
+  MPF alone is not treated as HDR). Two Pillow facts shaped the
+  implementation, both measured: its MPO saver corrupts the MPF offsets when
+  the primary carries ICC/XMP (hence the hand-built index), and it refuses to
+  *open* Ultra HDR files as MPO (hence `imageio`'s own MPF-index fallback on
+  read — which also lets FaceKeep ingest real Pixel/Android Ultra HDR JPEGs).
+- **`restore -f avif` → an HDR AVIF (9.2), via the external tool.** The
+  restored base is linearized, boosted per pixel by `2^(headroom × gain)`
+  (`aggressive.gain_map_headroom`, default 3 stops — validated value-for-value
+  against libavif's own conversion of a real iPhone photo), PQ-encoded into an
+  HDR alternate, and `avifgainmaputil combine` writes the gain-map AVIF.
+
+Graceful degradation everywhere (principle 4): a non-HDR-capable output
+(`.jxl`/`.png`/`.webp`), a machine without the `avifgainmaputil` binary on the
+AVIF path (the same opt-in `.tools`/PATH family as `avifenc`), or any
+re-attach/authoring failure falls back to the normal SDR write with a warning
+— never a hard fail, and `preview()` never re-attaches (too slow for
+interactive use, and preview *pixels* are identical either way). Honest
+limits, documented in the format spec: the AVIF tool rejects ICC-profiled
+inputs, so that path declares color via CICP (equivalent for the P3/sRGB
+profiles every iPhone uses; the JPEG path embeds the real profile); and the
+background under the gain map is reconstructed, so its HDR is approximate —
+the faces/patches are real pixels with real HDR boost, the same "plausible,
+not faithful" bargain the mode already makes. `preserve_gain_map` is
+compress-side → fingerprinted; `gain_map_headroom` is restore-only → not.
 
 **Face enhancement of reconstructed background faces** is the restore-side
 safety net for the recall guardrails above. Detection biases toward recall, but
@@ -623,8 +647,13 @@ documented in [fkeep-format.md](fkeep-format.md).
   when its XMP names a gain map, so a stereo MPO is never misread) rides
   `LoadedImage.gain_map` / `gain_map_meta`, kept upright and aligned with the
   base pixels. Extraction is best-effort (`None` on any failure — a gain map
-  never fails a load); nothing consumes it yet — storing and re-attaching it is
-  Phase 9.2.
+  never fails a load); aggressive compress stores it and restore re-attaches
+  it (9.2 AVIF / 9.3 Ultra HDR JPEG — see the gain-map section above). The
+  JPEG read has an **Ultra HDR fallback** (9.3): current Pillow refuses to
+  open Ultra HDR JPEGs as MPO (the `hdrgm:Version` sniff), so when a plain
+  JPEG still carries an MPF APP2 the MP index is parsed directly
+  (`_parse_mpf_index`) and the secondary frames decoded standalone — FaceKeep
+  reads back its own restore output *and* real Pixel/Android Ultra HDR photos.
 - **faithful.py** — the default pipeline.
 - **index.py** — incremental-processing cache (stdlib `sqlite3`): records each
   file's content hash + settings fingerprint + output path so a re-run skips

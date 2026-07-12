@@ -758,7 +758,7 @@ class Restorer:
         return result
 
     def _write(self, result, output_path, exif, *, icc=None, has_faces=False,
-               quality=70, out_bit_depth=8, gain_map=None):
+               quality=70, out_bit_depth=8, gain_map=None, gain_map_jpeg=None):
         """Write the restored image to a standard file, format chosen by suffix.
 
         Restore is meant to be the "never a dead end" escape hatch (ROADMAP
@@ -780,9 +780,17 @@ class Restorer:
           manifest 1.10.0+) -> ``encoders.encode_gainmap_avif`` re-attaches the
           gain map via the external ``avifgainmaputil`` binary, producing a
           backward-compatible HDR AVIF (EXIF rides along; color is declared as
-          CICP — the tool refuses ICC inputs). Missing binary, a non-avif
-          output, or any re-attach failure falls back to the normal SDR write
-          with a warning — never a hard fail (offline-first).
+          CICP — the tool refuses ICC inputs). Missing binary or any re-attach
+          failure falls back to the normal SDR write with a warning — never a
+          hard fail (offline-first).
+        * ``.jpg``/``.jpeg`` **with a stored HDR gain map** (ROADMAP 9.3) ->
+          ``encoders.encode_gainmap_jpeg`` writes an **Ultra HDR JPEG** — the
+          default output is HDR. Pure Pillow + a hand-built MPF index, **no
+          external binary**; the stored ``gainmap.jpg`` bytes ride verbatim as
+          the MPF second frame (zero re-encode) and EXIF + the real ICC
+          profile stay on the primary. Any authoring failure falls back to the
+          plain SDR JPEG write with a warning. Other formats (``.jxl``/
+          ``.png``/``.webp``) cannot carry the map and warn SDR.
 
         BGR stays internal: the only BGR->RGB conversions are at the PIL boundary
         here and inside ``encoders.encode``, per the repo convention.
@@ -793,19 +801,15 @@ class Restorer:
         # the bundled JXL are 8-bit, so those round it down with a clear warning.
         high_bit = result.dtype == np.uint16
 
-        # iPhone HDR gain map (manifest 1.10.0+): re-attach it so the output is
-        # a real HDR AVIF (SDR viewers see the base — backward compatible).
-        # Only the .avif output can carry it, and only via the external
-        # avifgainmaputil binary; every other combination falls through to the
-        # normal SDR write with a warning (offline-first, never a hard fail).
+        # iPhone HDR gain map (manifest 1.10.0+): re-attach it so the output
+        # stays HDR (SDR viewers see the base — backward compatible). Two
+        # carriers: .avif via the external avifgainmaputil binary (9.2), and
+        # .jpg/.jpeg as an Ultra HDR JPEG via pure Pillow (9.3 — the default
+        # output format, no binary needed). Every other combination falls
+        # through to the normal SDR write with a warning (offline-first,
+        # never a hard fail).
         if gain_map is not None:
-            if suffix != ".avif":
-                logger.warning(
-                    "This .fkeep carries an HDR gain map, but only an .avif "
-                    "output can re-attach it; writing SDR %s. Use `restore -f "
-                    "avif` for HDR.", suffix or "output",
-                )
-            else:
+            if suffix == ".avif":
                 from .. import encoders
 
                 if not encoders.avifgainmaputil_available():
@@ -830,6 +834,41 @@ class Restorer:
                             "HDR gain-map re-attach failed (%s); writing SDR "
                             "AVIF instead.", e,
                         )
+            elif suffix in (".jpg", ".jpeg"):
+                from .. import encoders
+
+                img8 = result
+                if high_bit:
+                    logger.warning(
+                        "%s is an 8-bit format; the restored HDR is rounded "
+                        "down to 8-bit. Restore to .avif for true 10/12-bit "
+                        "HDR.", suffix,
+                    )
+                    img8 = _match_dtype(result, np.uint8)
+                try:
+                    # Prefer the raw stored member bytes (zero re-encode);
+                    # the decoded array is the fallback carrier.
+                    data = encoders.encode_gainmap_jpeg(
+                        img8,
+                        gain_map_jpeg if gain_map_jpeg is not None else gain_map,
+                        headroom=self.config.gain_map_headroom,
+                        quality=95, exif=exif, icc=icc,
+                    )
+                    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(output_path).write_bytes(data)
+                    return
+                except EncodingError as e:
+                    logger.warning(
+                        "HDR gain-map JPEG authoring failed (%s); writing SDR "
+                        "JPEG instead.", e,
+                    )
+            else:
+                logger.warning(
+                    "This .fkeep carries an HDR gain map, but only .avif and "
+                    ".jpg outputs can carry it; writing SDR %s. Use `restore "
+                    "-f avif` (or the default .jpg) for HDR.",
+                    suffix or "output",
+                )
 
         if suffix in (".avif", ".jxl"):
             from .. import encoders
@@ -973,7 +1012,8 @@ class Restorer:
                         icc=data.get("icc"),
                         has_faces=bool(m["faces"]), quality=quality,
                         out_bit_depth=out_bit_depth,
-                        gain_map=data.get("gain_map"))
+                        gain_map=data.get("gain_map"),
+                        gain_map_jpeg=data.get("gain_map_jpeg"))
         return result
 
     def preview(self, fkeep_path: str, output_path: Optional[str] = None,

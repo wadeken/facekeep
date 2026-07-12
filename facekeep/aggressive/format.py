@@ -687,9 +687,14 @@ def read_fkeep(fkeep_path: str) -> dict:
             # iPhone HDR gain map (manifest 1.10.0+). Absent on older files /
             # gain-map-less photos -> None, and restore writes SDR as before.
             # IMREAD_UNCHANGED keeps a grayscale member 2-D (the normal case).
+            # The raw member bytes ride along too: the Ultra HDR JPEG restore
+            # path (9.3) reuses them verbatim as the MPF frame — zero re-encode.
+            gain_map_jpeg = (
+                zf.read("gainmap.jpg") if "gainmap.jpg" in names else None
+            )
             gain_map = (
-                _decode(zf.read("gainmap.jpg"), cv2.IMREAD_UNCHANGED)
-                if "gainmap.jpg" in names else None
+                _decode(gain_map_jpeg, cv2.IMREAD_UNCHANGED)
+                if gain_map_jpeg is not None else None
             )
     except (zipfile.BadZipFile, KeyError, json.JSONDecodeError) as e:
         raise FormatError(f"Malformed .fkeep file {fkeep_path}: {e}") from e
@@ -706,6 +711,7 @@ def read_fkeep(fkeep_path: str) -> dict:
         "icc": icc,
         "residual": residual,
         "gain_map": gain_map,
+        "gain_map_jpeg": gain_map_jpeg,
     }
 
 
