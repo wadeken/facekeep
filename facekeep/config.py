@@ -298,6 +298,21 @@ class AggressiveConfig:
     residual_scale: float = 0.5  # resolution the residual is stored at (1.0 = full)
     residual_quality: int = 60  # encode quality for the residual member (1-100)
 
+    # iPhone HDR gain-map preservation (Phase 9). A modern iPhone HDR photo is
+    # an 8-bit base plus an HDR *gain map* (imageio.load extracts it). When on
+    # (the default — "just preserve it") and the source carried one, the gain
+    # map is stored in the .fkeep (gainmap.jpg + manifest flag, 1.10.0+) so
+    # `restore -f avif` can re-attach it and emit a real HDR AVIF. Sources
+    # without a gain map are byte-identical either way. Compress-side and
+    # output-affecting -> in index.settings_fingerprint.
+    preserve_gain_map: bool = True
+    # Restore-side: HDR headroom in stops used to rebuild the HDR alternate
+    # when re-attaching the gain map (linear boost = 2^(headroom * gain)).
+    # Apple's exact per-photo headroom lives in maker notes there is no offline
+    # parser for; 3.0 matches the real-photo reference libavif derived from
+    # Apple's own metadata. Restore-only -> NOT fingerprinted.
+    gain_map_headroom: float = 3.0
+
     # Quality-targeted bg_scale (opt-in). When `quality_target` is set, instead
     # of compressing every photo at the fixed `bg_scale`, search the candidate
     # scales for the *most aggressive* one whose reconstructed background still
@@ -671,6 +686,11 @@ aggressive:
   residual: {str(a.residual).lower()}
   residual_scale: {a.residual_scale}   # resolution the residual is stored at
   residual_quality: {a.residual_quality}   # encode quality for the residual member
+  # iPhone HDR: store the source's HDR gain map in the .fkeep when it has one;
+  # `restore -f avif` re-attaches it -> a backward-compatible HDR AVIF (needs
+  # the avifgainmaputil binary at restore; otherwise SDR + a warning).
+  preserve_gain_map: {str(a.preserve_gain_map).lower()}
+  gain_map_headroom: {a.gain_map_headroom}   # HDR headroom (stops) used at re-attach
   model: {a.model}   # restore super-resolution model ([ai] extra)
   # Face restoration of detector-missed background faces on restore.
   # gfpgan ([ai] extra) | codeformer ([codeformer] extra, with [ai]; S-Lab
@@ -793,6 +813,11 @@ class FaceKeepConfig:
         if not 1 <= self.aggressive.residual_quality <= 100:
             raise ConfigError(
                 "aggressive.residual_quality must be between 1 and 100"
+            )
+        if not 0 < self.aggressive.gain_map_headroom <= 6:
+            raise ConfigError(
+                "aggressive.gain_map_headroom must be between 0 (exclusive) "
+                "and 6 stops"
             )
         if self.aggressive.protect_hands_backend not in (None, "mediapipe"):
             raise ConfigError(

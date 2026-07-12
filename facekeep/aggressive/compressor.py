@@ -622,6 +622,14 @@ class CompressedPhoto:
     # codec's own loss. None => no residual member is written.
     original_image: Optional[np.ndarray] = None
 
+    # iPhone HDR gain map (Phase 9, manifest 1.10.0+): the source's HDR gain
+    # map as extracted by imageio.load (single-channel, typically half the
+    # original resolution, upright/aligned with the frame). Stored as
+    # gainmap.jpg so restore can re-attach it into an HDR AVIF. None when the
+    # source had none or aggressive.preserve_gain_map is off — such photos
+    # pack byte-identically to a gain-map-less file (manifest flag aside).
+    gain_map: Optional[np.ndarray] = None
+
 
 def compress_photo(
     image_path: str,
@@ -849,4 +857,8 @@ def compress_photo(
         # background to the 16-bit scale to difference against it). Non-high-bit
         # keeps ``crop_pixels is bg_pixels``, so the 8-bit path is byte-identical.
         original_image=crop_pixels if cfg.residual else None,
+        # HDR gain map (Phase 9): carried when the source had one and the
+        # preserve flag (default on) is set. The loader already aligned it with
+        # the upright frame, which is the geometry restore rebuilds.
+        gain_map=loaded.gain_map if cfg.preserve_gain_map else None,
     )

@@ -18,6 +18,11 @@ A .fkeep file is a ZIP archive (so anyone can inspect it with `unzip`):
                       as uint8 (value/2 + 128) at residual_scale resolution.
                       Restore adds it back to a bicubic upscale, making the
                       background real (lossy) data instead of a hallucination.
+  gainmap.jpg       - optional (manifest 1.10.0+, aggressive.preserve_gain_map):
+                      the source's iPhone HDR gain map (single-channel JPEG,
+                      typically half resolution, upright). Restore re-attaches
+                      it into an HDR AVIF (`restore -f avif`) via
+                      avifgainmaputil; manifest flag: gain_map_preserved.
 """
 
 import hashlib
@@ -402,7 +407,8 @@ def _write_archive(zf: zipfile.ZipFile, photo: CompressedPhoto, manifest: dict,
                    bg_ext: str, bg_bytes: bytes, thumb_bytes: bytes,
                    face_payloads: list, mask_payloads: list,
                    region_payloads: list, region_mask_payloads: list,
-                   residual_payload: Optional[Tuple[str, bytes]] = None) -> None:
+                   residual_payload: Optional[Tuple[str, bytes]] = None,
+                   gain_map_payload: Optional[bytes] = None) -> None:
     """Write all .fkeep entries into an open ZipFile (file- or memory-backed).
 
     Shared by the real write and the dry-run estimate so both pack byte-for-byte
@@ -436,6 +442,10 @@ def _write_archive(zf: zipfile.ZipFile, photo: CompressedPhoto, manifest: dict,
     # byte-identically to the pre-1.6.0 layout (manifest aside).
     if residual_payload is not None:
         zf.writestr(f"residual.{residual_payload[0]}", residual_payload[1])
+    # iPhone HDR gain map (manifest 1.10.0+, aggressive.preserve_gain_map):
+    # stored so restore can re-attach it into an HDR AVIF. None -> no member.
+    if gain_map_payload is not None:
+        zf.writestr("gainmap.jpg", gain_map_payload)
 
 
 def write_fkeep(photo: CompressedPhoto, output_path: str,
@@ -489,6 +499,20 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
         [d for _, _, d in face_enc + region_enc] + [residual_bit_depth]
     )
 
+    # iPhone HDR gain map (manifest 1.10.0+): stored as a single-channel JPEG
+    # (Apple itself stores it lossy; q90 on a half-res gray map costs little).
+    # compress_photo attaches it only when the source carried one AND
+    # aggressive.preserve_gain_map is on, so None here means "no member".
+    gain_map_payload = None
+    if photo.gain_map is not None:
+        gm = photo.gain_map
+        if gm.dtype != np.uint8:
+            gm = _to_uint8(gm)
+        ok, buf = cv2.imencode(".jpg", gm, [cv2.IMWRITE_JPEG_QUALITY, 90])
+        if not ok:
+            raise EncodingError("Failed to encode the HDR gain map member.")
+        gain_map_payload = buf.tobytes()
+
     payload_size = (
         len(bg_bytes) + len(thumb_bytes)
         + sum(len(p) for _, p in face_payloads)
@@ -496,16 +520,18 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
         + sum(len(p) for _, p in region_payloads)
         + sum(len(m) for m in region_mask_payloads)
         + (len(residual_payload[1]) if residual_payload else 0)
+        + (len(gain_map_payload) if gain_map_payload else 0)
     )
 
     manifest = {
-        # 1.9.0 made the residual layer high-bit too (residual.avif; manifest
-        # bit_depth then covers it); 1.8.0 added settings.bit_depth + high-bit
-        # crops; 1.7.0 the optional preset key; 1.6.0 the residual layer. Readers
-        # are tolerant by structure, so older readers restore 1.9.0 files unchanged
-        # (one that ignores residual.avif just hallucinates the bg, as without a
-        # residual).
-        "version": "1.9.0",
+        # 1.10.0 added the optional gainmap.jpg member + the gain_map_preserved
+        # flag (iPhone HDR gain-map preservation, Phase 9); 1.9.0 made the
+        # residual layer high-bit too (residual.avif; manifest bit_depth then
+        # covers it); 1.8.0 added settings.bit_depth + high-bit crops; 1.7.0 the
+        # optional preset key; 1.6.0 the residual layer. Readers are tolerant by
+        # structure, so older readers restore 1.10.0 files unchanged (one that
+        # ignores gainmap.jpg just restores SDR, exactly as before Phase 9).
+        "version": "1.10.0",
         "mode": "aggressive",
         "original": {
             "filename": photo.original_filename,
@@ -519,6 +545,10 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
         # True iff an icc.bin member is present (the source had an ICC profile,
         # e.g. Display P3). Added in manifest 1.4.0; absent on older files.
         "icc_preserved": photo.icc is not None,
+        # True iff a gainmap.jpg member is present (the source carried an iPhone
+        # HDR gain map and preserve_gain_map was on). Added in manifest 1.10.0;
+        # absent on older files. Same flag family as exif/icc_preserved.
+        "gain_map_preserved": gain_map_payload is not None,
         "settings": {
             "bg_scale": photo.effective_bg_scale,
             "bg_quality": cfg.bg_quality,
@@ -599,7 +629,7 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
             _write_archive(zf, photo, manifest, bg_ext, bg_bytes, thumb_bytes,
                            face_payloads, mask_payloads,
                            region_payloads, region_mask_payloads,
-                           residual_payload)
+                           residual_payload, gain_map_payload)
         return buf.tell()
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -607,7 +637,7 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
         _write_archive(zf, photo, manifest, bg_ext, bg_bytes, thumb_bytes,
                        face_payloads, mask_payloads,
                        region_payloads, region_mask_payloads,
-                       residual_payload)
+                       residual_payload, gain_map_payload)
 
     return path.stat().st_size
 
@@ -653,6 +683,14 @@ def read_fkeep(fkeep_path: str) -> dict:
             # Residual layer (manifest 1.6.0+). Absent on older files / when the
             # layer is off -> None, and restore takes the normal AI/bicubic path.
             residual = _read_residual(zf, names)
+
+            # iPhone HDR gain map (manifest 1.10.0+). Absent on older files /
+            # gain-map-less photos -> None, and restore writes SDR as before.
+            # IMREAD_UNCHANGED keeps a grayscale member 2-D (the normal case).
+            gain_map = (
+                _decode(zf.read("gainmap.jpg"), cv2.IMREAD_UNCHANGED)
+                if "gainmap.jpg" in names else None
+            )
     except (zipfile.BadZipFile, KeyError, json.JSONDecodeError) as e:
         raise FormatError(f"Malformed .fkeep file {fkeep_path}: {e}") from e
 
@@ -667,6 +705,7 @@ def read_fkeep(fkeep_path: str) -> dict:
         "exif": exif,
         "icc": icc,
         "residual": residual,
+        "gain_map": gain_map,
     }
 
 
@@ -706,6 +745,8 @@ class VerifyReport:
     region_masks_found: int = 0
     residual_declared: bool = False  # manifest settings.residual flag (1.6.0+)
     residual_ok: bool = False  # the declared residual member exists and decodes
+    gain_map_declared: bool = False  # manifest gain_map_preserved flag (1.10.0+)
+    gain_map_ok: bool = False  # the declared gainmap.jpg exists and decodes
     background_size: Optional[Tuple[int, int]] = None  # (width, height)
     original_size: Optional[Tuple[int, int]] = None     # (width, height)
     thumbnail_ok: bool = False
@@ -751,6 +792,9 @@ def verify_fkeep(fkeep_path: str, original_path: Optional[str] = None) -> Verify
     8. (manifest 1.6.0+) when ``settings.residual`` declares a residual layer,
        the ``residual.(jxl|jpg)`` member (located in that order) is present and
        decodes. A residual-less file is unchanged.
+    9. (manifest 1.10.0+) when ``gain_map_preserved`` declares an HDR gain map,
+       the ``gainmap.jpg`` member is present and decodes. A gain-map-less file
+       is unchanged.
 
     Any failure of 2-7 leaves the file *readable but inconsistent*: the report's
     ``ok`` is False with the specifics in ``problems`` (no exception). Only a
@@ -792,12 +836,14 @@ def verify_fkeep(fkeep_path: str, original_path: Optional[str] = None) -> Verify
 
     settings = manifest.get("settings", {}) or {}
     residual_declared = bool(settings.get("residual"))
+    gain_map_declared = bool(manifest.get("gain_map_preserved"))
 
     crops_found = 0
     masks_found = 0
     region_crops_found = 0
     region_masks_found = 0
     residual_ok = False
+    gain_map_ok = False
     background_size: Optional[Tuple[int, int]] = None
     thumbnail_ok = False
 
@@ -919,6 +965,22 @@ def verify_fkeep(fkeep_path: str, original_path: Optional[str] = None) -> Verify
                         problems.append(f"{res_member} does not decode")
                     else:
                         residual_ok = True
+
+            # HDR gain map (manifest 1.10.0+): a declared gain map must have a
+            # decodable gainmap.jpg — restore relies on it for the HDR AVIF
+            # path. Same problem-not-crash contract as the residual.
+            if gain_map_declared:
+                if "gainmap.jpg" not in names:
+                    problems.append(
+                        "manifest declares an HDR gain map but gainmap.jpg "
+                        "is missing"
+                    )
+                else:
+                    gm = _decode(zf.read("gainmap.jpg"), cv2.IMREAD_UNCHANGED)
+                    if gm is None:
+                        problems.append("gainmap.jpg does not decode")
+                    else:
+                        gain_map_ok = True
     except (zipfile.BadZipFile, KeyError) as e:
         # The manifest read above succeeded, so a failure here means a member is
         # named in the directory but unreadable — a corrupt archive.
@@ -966,6 +1028,8 @@ def verify_fkeep(fkeep_path: str, original_path: Optional[str] = None) -> Verify
         region_masks_found=region_masks_found,
         residual_declared=residual_declared,
         residual_ok=residual_ok,
+        gain_map_declared=gain_map_declared,
+        gain_map_ok=gain_map_ok,
         background_size=background_size,
         original_size=original_size,
         thumbnail_ok=thumbnail_ok,

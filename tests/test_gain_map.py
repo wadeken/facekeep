@@ -21,6 +21,7 @@ HEIC is only ever loaded through ``imageio.load`` (open_heif) — never PIL
 ``Image.open`` — per the dual-API segfault rule in CLAUDE.md.
 """
 
+import gc
 from pathlib import Path
 
 import cv2
@@ -181,6 +182,14 @@ def test_real_iphone_heic_gain_map():
     gh, gw = loaded.gain_map.shape
     assert abs(gh / loaded.height - 0.5) < 0.01
     assert abs(gw / loaded.width - 0.5) < 0.01
+    # LOAD-BEARING: actually READ the pixel data after the HeifFile is out of
+    # scope and collected. np.asarray on a pillow_heif aux image is a zero-copy
+    # view into libheif memory; without the .copy() in _read_heif_gain_map this
+    # is a use-after-free access violation (shipped once — metadata-only
+    # assertions like .shape cannot catch it).
+    gc.collect()
+    assert 0 < int(loaded.gain_map.max()) <= 255
+    assert float(loaded.gain_map.mean()) > 0.0
 
 
 @pytest.mark.skipif(not REAL_JPG.exists(), reason="local iPhone sample not present")
@@ -199,3 +208,7 @@ def test_real_iphone_jpeg_gain_map():
     assert gh > gw
     assert abs(gh / loaded.height - 0.5) < 0.01
     assert abs(gw / loaded.width - 0.5) < 0.01
+    # Read the data too (see the HEIC test: metadata-only checks miss a
+    # use-after-free; the PIL path is copy-safe but pin it the same way).
+    gc.collect()
+    assert 0 < int(loaded.gain_map.max()) <= 255

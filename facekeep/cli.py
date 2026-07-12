@@ -1105,6 +1105,10 @@ def info(fkeep_path):
             f"Residual:    yes (scale {s.get('residual_scale', '?')} - "
             "background restores from real data, no AI hallucination)"
         )
+    if m.get("gain_map_preserved"):
+        click.echo(
+            "HDR gainmap: yes (restore to .avif re-attaches it -> HDR output)"
+        )
     click.echo(f"Created:     {m.get('created_at', 'N/A')}")
     click.echo(f"FaceKeep:    v{m.get('facekeep_version', 'N/A')}")
 
@@ -1229,6 +1233,9 @@ def verify(fkeep_path, original_path):
     if rep.residual_declared:
         res_mark = f"present  {good}" if rep.residual_ok else f"missing/undecodable  {bad}"
         click.echo(f"  residual:     {res_mark}")
+    if rep.gain_map_declared:
+        gm_mark = f"present  {good}" if rep.gain_map_ok else f"missing/undecodable  {bad}"
+        click.echo(f"  gain map:     {gm_mark}")
     click.echo(
         f"  thumbnail:    {f'present  {good}' if rep.thumbnail_ok else f'missing  {bad}'}"
     )

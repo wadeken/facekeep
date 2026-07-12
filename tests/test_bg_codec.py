@@ -208,7 +208,7 @@ def test_avif_bg_smaller_than_jpeg_on_smooth_content(tmp_path):
 def test_default_bg_is_jpg_and_manifest_records_codec(tmp_path):
     """The default config still stores background.jpg; the manifest says so.
 
-    The schema version is the *current* writer schema (1.9.0 = the high-bit
+    The schema version is the *current* writer schema (1.10.0 = the gain-map
     residual bump), not bg_codec's own 1.5.0.
     """
     bg = _smooth_background(480, 320)
@@ -218,7 +218,7 @@ def test_default_bg_is_jpg_and_manifest_records_codec(tmp_path):
     assert name == "background.jpg"
     info = read_fkeep_info(str(fkeep))
     assert info["settings"]["bg_codec"] == "jpg"
-    assert info["version"] == "1.9.0"
+    assert info["version"] == "1.10.0"
 
 
 def test_default_bg_bytes_byte_identical_to_cv2_jpeg(tmp_path):

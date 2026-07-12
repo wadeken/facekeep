@@ -321,6 +321,201 @@ def decode_highbit_avif(data: bytes) -> np.ndarray:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _find_avifgainmaputil() -> Optional[str]:
+    """Locate the external ``avifgainmaputil`` binary, or ``None`` if unavailable.
+
+    Re-attaching an iPhone HDR gain map on aggressive restore (Phase 9) needs
+    libavif's ``avifgainmaputil`` CLI — its ``combine`` subcommand is the only
+    tool here that can write an AVIF with an *embedded gain map* (no bundled
+    codec can). It ships beside ``avifenc`` in the libavif release, so the
+    resolution order mirrors ``_find_avifdec``:
+
+    1. ``$FACEKEEP_AVIFGAINMAPUTIL`` (explicit override — exact path),
+    2. ``avifgainmaputil`` as a sibling of the located ``avifenc`` (a single
+       ``$FACEKEEP_AVIFENC`` enables the whole avif tool family),
+    3. ``avifgainmaputil`` on the system ``PATH``,
+    4. ``None`` → callers fall back to the SDR write with a warning.
+
+    Offline-first / graceful degradation: a missing binary is not an error —
+    HDR re-attach is a best-effort upgrade, never required.
+    """
+    env = os.environ.get("FACEKEEP_AVIFGAINMAPUTIL")
+    if env:
+        p = Path(env)
+        if p.is_file():
+            return str(p)
+        logger.warning(
+            "FACEKEEP_AVIFGAINMAPUTIL=%s is not a file; falling back to "
+            "sibling/PATH.", env,
+        )
+    enc = _find_avifenc()
+    if enc:
+        sibling = Path(enc).with_name(
+            "avifgainmaputil.exe" if enc.lower().endswith(".exe")
+            else "avifgainmaputil"
+        )
+        if sibling.is_file():
+            return str(sibling)
+    return shutil.which("avifgainmaputil")
+
+
+def avifgainmaputil_available() -> bool:
+    """Return True if the external ``avifgainmaputil`` binary can be located."""
+    return _find_avifgainmaputil() is not None
+
+
+# SDR diffuse white in nits for the PQ-encoded HDR alternate (BT.2408's 203).
+_GAINMAP_SDR_WHITE_NITS = 203.0
+
+
+def _srgb_eotf(v: np.ndarray) -> np.ndarray:
+    """sRGB electro-optical transfer: encoded [0,1] -> linear light [0,1].
+
+    Display P3 uses the same transfer curve as sRGB, so this covers both the
+    sRGB and the (iPhone-default) Display P3 base images.
+    """
+    return np.where(v <= 0.04045, v / 12.92, ((v + 0.055) / 1.055) ** 2.4)
+
+
+def _pq_oetf(nits: np.ndarray) -> np.ndarray:
+    """SMPTE ST 2084 (PQ) inverse EOTF: linear nits -> PQ-encoded [0,1]."""
+    L = np.clip(nits / 10000.0, 0.0, 1.0)
+    m1, m2 = 2610 / 16384, 2523 / 4096 * 128
+    c1, c2, c3 = 3424 / 4096, 2413 / 4096 * 32, 2392 / 4096 * 32
+    lm1 = L**m1
+    return ((c1 + c2 * lm1) / (1 + c3 * lm1)) ** m2
+
+
+def encode_gainmap_avif(
+    image_bgr: np.ndarray,
+    gain_map: np.ndarray,
+    *,
+    headroom: float = 3.0,
+    quality: int = 70,
+    gain_map_quality: int = 75,
+    exif: Optional[bytes] = None,
+    icc: Optional[bytes] = None,
+) -> bytes:
+    """Encode a BGR image + HDR gain map to a gain-map AVIF via ``avifgainmaputil``.
+
+    Produces a **backward-compatible HDR AVIF**: SDR viewers show the base
+    image; HDR viewers multiply it by the gain map (scaled to the display's
+    headroom) to extend highlights — the same mechanism as an iPhone HDR photo.
+    ``combine`` wants the base plus the *fully-applied* HDR alternate, so this
+    rebuilds the alternate the way the OS would: linearize the base (sRGB/P3
+    transfer), boost by ``2^(headroom * gain)`` per pixel (validated against a
+    libavif-converted reference of a real iPhone photo — the raw Apple gain map
+    is carried value-for-value at gamma 1), then PQ-encode at an SDR white of
+    203 nits into a 16-bit PNG.
+
+    Metadata honesty (both verified by probing the tool):
+
+    * **EXIF rides through** — it is embedded in the temp base PNG (eXIf chunk)
+      and ``combine`` copies it into the output.
+    * **ICC cannot** — ``combine`` refuses inputs with ICC profiles ("not
+      supported"), so color is declared via CICP instead: a Display P3 profile
+      (sniffed by name) maps to primaries 12, anything else to sRGB primaries 1
+      (transfer 13 base / 16 (PQ) alternate). For P3/sRGB sources — every
+      iPhone — CICP is color-equivalent to the profile; an exotic profile would
+      be approximated, which is the documented limit of this path.
+
+    Args:
+        image_bgr: The restored base image, uint8 BGR (a uint16 input is
+            rounded down — the gain-map HDR mechanism is an 8-bit base by
+            construction).
+        gain_map: The stored gain map (2-D uint8, any resolution; a 3-channel
+            BGR map is applied per channel). Resized to the base size.
+        headroom: HDR headroom in stops (``aggressive.gain_map_headroom``).
+        quality: 0-100 quality for the base/alternate color.
+        gain_map_quality: 0-100 quality for the embedded gain map.
+        exif: Optional EXIF bytes to carry into the output.
+        icc: Optional source ICC bytes — used only to *choose* the CICP
+            primaries (see above), never embedded.
+
+    Returns:
+        Encoded gain-map AVIF bytes.
+
+    Raises:
+        EncodingError: if ``avifgainmaputil`` is unavailable or the subprocess
+            fails. Callers (aggressive restore) catch this and fall back to the
+            plain SDR AVIF write, warned.
+    """
+    binary = _find_avifgainmaputil()
+    if binary is None:
+        raise EncodingError(
+            "avifgainmaputil not found (set FACEKEEP_AVIFENC or put the libavif "
+            "tools on PATH); cannot write a gain-map (HDR) AVIF."
+        )
+
+    if image_bgr.dtype == np.uint16:
+        image_bgr = np.round(image_bgr.astype(np.float32) / 257.0).astype(np.uint8)
+    elif image_bgr.dtype != np.uint8:
+        image_bgr = np.clip(image_bgr, 0, 255).astype(np.uint8)
+
+    h, w = image_bgr.shape[:2]
+    gm = cv2.resize(gain_map, (w, h), interpolation=cv2.INTER_CUBIC)
+    gain = gm.astype(np.float32) / 255.0
+    if gain.ndim == 2:
+        gain = gain[..., None]
+
+    # Rebuild the fully-applied HDR alternate: linear boost, PQ-encoded 16-bit.
+    base_lin = _srgb_eotf(image_bgr.astype(np.float32) / 255.0)
+    alt_lin = base_lin * (2.0 ** (float(headroom) * gain))
+    alt_pq = _pq_oetf(alt_lin * _GAINMAP_SDR_WHITE_NITS)
+    alt16 = np.round(alt_pq * 65535.0).astype(np.uint16)
+
+    # CICP by profile: Display P3 (the iPhone default) -> primaries 12, else
+    # sRGB primaries 1. Transfer: 13 (sRGB) base, 16 (PQ) alternate; matrix 6.
+    primaries = 12 if (icc and b"Display P3" in icc) else 1
+    cicp_base = f"{primaries}/13/6"
+    cicp_alt = f"{primaries}/16/6"
+
+    tmpdir = tempfile.mkdtemp(prefix="facekeep_gainmap_")
+    try:
+        base_png = os.path.join(tmpdir, "base.png")
+        alt_png = os.path.join(tmpdir, "alt.png")
+        out_avif = os.path.join(tmpdir, "out.avif")
+
+        # Base via PIL so the EXIF bytes ride along as a PNG eXIf chunk (cv2
+        # can't write one); BGR->RGB at the PIL boundary per the repo rule. No
+        # ICC on purpose — combine rejects profiled inputs (see docstring).
+        from PIL import Image
+
+        pil = Image.fromarray(cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB))
+        save_kwargs = {"exif": exif} if exif else {}
+        pil.save(base_png, **save_kwargs)
+        pil.close()
+        # Alternate via cv2: writes the BGR uint16 array to a correct RGB PNG
+        # (straight through — a cvtColor here would double-swap R/B, the same
+        # rule as encode_highbit_avif).
+        if not cv2.imwrite(alt_png, alt16):
+            raise EncodingError("Failed to write the temporary HDR alternate PNG.")
+
+        cmd = [
+            binary, "combine", base_png, alt_png, out_avif,
+            "--cicp-base", cicp_base,
+            "--cicp-alternate", cicp_alt,
+            "-q", str(quality),
+            "--qgain-map", str(gain_map_quality),
+            # Store the gain map at half resolution — Apple's own native scale.
+            "--downscaling", "2",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise EncodingError(f"avifgainmaputil invocation failed: {e}") from e
+        if proc.returncode != 0:
+            raise EncodingError(
+                f"avifgainmaputil exited {proc.returncode}: "
+                f"{(proc.stderr or proc.stdout).strip()[:300]}"
+            )
+        if not os.path.isfile(out_avif):
+            raise EncodingError("avifgainmaputil produced no output file.")
+        return Path(out_avif).read_bytes()
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def encode_lossless_avif(
     image_bgr: np.ndarray,
     *,

@@ -15,7 +15,7 @@ all** (see [Manual recovery](#manual-recovery-without-facekeep)).
 - **Extension:** `.fkeep`
 - **Container:** a ZIP archive (`zipfile.ZIP_DEFLATED`). Anything that opens a
   `.zip` opens a `.fkeep` — just rename it, or point `unzip` straight at it.
-- **Current manifest version:** `1.9.0` (see [Versioning](#versioning--compatibility)).
+- **Current manifest version:** `1.10.0` (see [Versioning](#versioning--compatibility)).
 
 ---
 
@@ -67,6 +67,7 @@ index (`000`, `001`, …) matching the face's `id` in the manifest (and, for the
 | `region_NNN.(jpg\|avif\|jxl\|png)` | one per region (manifest 1.3.0+; only when region-local conservatism fired) | same codec/precedence as face crops | A **region-local conservatism** patch: a near-original-resolution crop of a risky region — the background around a small/distant face, a **hand**, or a **text-like cluster** (signage; opt-in `protect_text`) — kept sharp instead of downsampled. Readers need no new key: a region is a region. Covers the region's `bbox`. |
 | `region_mask_NNN.png` | one per region | 8-bit grayscale PNG | Soft alpha mask for feathered compositing of the region patch. |
 | `residual.avif` / `residual.jxl` / `residual.jpg` | only when `settings.residual` is true (manifest 1.6.0+) | high-bit (10/12-bit) AVIF when `settings.bit_depth` > 8 (manifest 1.9.0+); else JPEG XL (q = `settings.residual_quality`), or JPEG as a warned fallback when the JXL plugin is unavailable | The **residual layer**: the real high-frequency delta the background downsample lost, at `settings.residual_scale` resolution, offset-encoded (`value/2 + 128` into uint8; high-bit: `value/2 + 32768` into uint16 — see [Image members](#image-members-in-detail)). Restore adds it back to a bicubic upscale, so the background is real (lossy) data, not a hallucination. |
+| `gainmap.jpg` | only when `gain_map_preserved` is true (manifest 1.10.0+) | grayscale JPEG q90 (typically half the original resolution) | The source's **iPhone HDR gain map** (the auxiliary image that makes an iPhone photo HDR — the base image is plain 8-bit SDR). Stored upright (aligned with the original frame). `facekeep restore -f avif` re-attaches it via `avifgainmaputil combine` into a backward-compatible **HDR AVIF**; any other output (or a machine without the binary) restores SDR with a warning. |
 | `exif.bin` | only if the source had EXIF | raw bytes | The original EXIF block, re-embedded into the restored image. |
 | `icc.bin` | only if the source had an ICC profile (manifest 1.4.0+) | raw bytes | The original ICC color profile (e.g. Display P3), re-embedded into the restored image so wide-gamut color survives. |
 
@@ -105,6 +106,12 @@ Notes:
   They are present only on manifest 1.3.0+ files where region-local conservatism
   fired; an older file (or a photo with no risky region) simply has no `region_*`
   members and an empty/absent `regions` array.
+- **At most one gain-map member** *(1.10.0+)*. When the top-level
+  `gain_map_preserved` flag is true there is exactly one `gainmap.jpg` (fixed
+  name — no extension search). It is a plain grayscale JPEG any viewer opens;
+  values encode the per-pixel HDR boost (`linear boost = 2^(headroom ×
+  value/255)`, headroom ≈ 3 stops). Files with the flag false/absent have no
+  member, and a reader that ignores it restores SDR exactly as before Phase 9.
 - **At most one residual member** *(1.6.0+)*. When `settings.residual` is true
   there is exactly one of `residual.avif` / `residual.jxl` / `residual.jpg`,
   **located in that order**. A high-bit (HDR) residual is a true 10/12-bit
@@ -130,8 +137,9 @@ Notes:
 - `thumbnail.jpg` is a convenience preview only; restore ignores it.
 - A well-formed `.fkeep` therefore has `2 + 2·N + 2·R` image members plus the
   manifest (and `+1` each for `exif.bin` / `icc.bin` if the source carried EXIF /
-  an ICC profile, and `+1` for the residual member on a 1.6.0+ file with
-  `settings.residual` true), where `N` is the number of faces and `R` the number
+  an ICC profile, `+1` for the residual member on a 1.6.0+ file with
+  `settings.residual` true, and `+1` for `gainmap.jpg` on a 1.10.0+ file with
+  `gain_map_preserved` true), where `N` is the number of faces and `R` the number
   of region patches (`R = 0` on pre-1.3.0 files; `icc.bin` only on 1.4.0+ files
   whose source had a profile). `facekeep verify` checks the crop/mask
   consistency — see [Integrity & verification](#integrity--verification).
@@ -152,6 +160,7 @@ keys (all present on a v1.1.0 file written by the current code):
 | `original` | object | Facts about the original input file — see below. |
 | `exif_preserved` | bool | `true` iff an `exif.bin` member is present. |
 | `icc_preserved` | bool | `true` iff an `icc.bin` member is present (the source had an ICC color profile). *(Added in manifest `1.4.0`; absent on older files.)* |
+| `gain_map_preserved` | bool | `true` iff a `gainmap.jpg` member is present (the source carried an iPhone HDR gain map and `aggressive.preserve_gain_map` was on — the default). *(Added in manifest `1.10.0`; absent on older files.)* |
 | `settings` | object | The aggressive-mode parameters used to produce this file — see below. |
 | `faces` | array | One entry per detected face — see below. May be empty (no faces found). |
 | `regions` | array | One entry per region-local conservatism patch — see below. *(Added in manifest `1.3.0`; absent/empty on older files and on photos with no risky region.)* |
@@ -233,7 +242,7 @@ A real two-face manifest (values illustrative):
 
 ```json
 {
-  "version": "1.9.0",
+  "version": "1.10.0",
   "mode": "aggressive",
   "original": {
     "filename": "2024.05.20_trip.jpg",
@@ -245,6 +254,7 @@ A real two-face manifest (values illustrative):
   },
   "exif_preserved": true,
   "icc_preserved": true,
+  "gain_map_preserved": false,
   "settings": {
     "bg_scale": 0.25,
     "bg_quality": 85,
@@ -344,6 +354,16 @@ region. `bg_scale` stays at the aggressive `0.25` for the rest of the frame.
     10/12-bit `residual.avif` (via `avifenc`, 4:4:4). Inverse: `value × 2 −
     65536`. Restore promotes the upscale to 16-bit and adds the delta, so the
     background comes back at full depth.
+- **`gainmap.jpg`** *(1.10.0+, only when `gain_map_preserved` is true)* — the
+  source's iPhone HDR gain map, carried through from load (HEIC aux image /
+  JPEG MPF second frame): a single-channel image, typically half the original
+  resolution, stored upright (aligned with the original frame — the same
+  orientation the restored image has). Grayscale JPEG q90 (Apple itself stores
+  the map lossy). Semantics: `linear boost = 2^(headroom × value/255)` per
+  pixel, with a headroom of ≈3 stops (validated value-for-value against
+  libavif's own conversion of a real iPhone photo). Restore uses it to rebuild
+  the fully-applied HDR alternate and embeds a gain map in the output AVIF via
+  `avifgainmaputil combine`.
 
 ---
 
@@ -403,6 +423,20 @@ region. `bg_scale` stays at the aggressive `0.25` for the rest of the frame.
    opens anywhere. Point `restore` at a folder to un-fkeep a whole library at once.)
    *Note: AVIF carries the ICC bytes verbatim; JXL re-serializes the profile from
    its internal color model (still a valid embedded profile, just not byte-identical).*
+7. *(1.10.0+, only when a `gainmap.jpg` member is present and the output is
+   `.avif`)* **Re-attach the HDR gain map.** The restored base is linearized,
+   boosted per pixel by `2^(headroom × gain)` (headroom =
+   `aggressive.gain_map_headroom`, default 3 stops), PQ-encoded into an HDR
+   alternate, and `avifgainmaputil combine` writes a **backward-compatible HDR
+   AVIF**: SDR viewers show the base, HDR displays extend the highlights — the
+   same mechanism as the original iPhone photo. EXIF rides along; color is
+   declared via CICP (Display P3 → primaries 12) because the tool does not
+   accept ICC-profiled inputs — equivalent for P3/sRGB sources, which is every
+   iPhone. A non-`.avif` output, a machine without the `avifgainmaputil`
+   binary, or any re-attach failure falls back to the normal SDR write above
+   with a warning (offline-first; never a hard fail). The aggressive caveat
+   applies honestly: the background under the gain map is reconstructed, so its
+   HDR is approximate — the faces/patches are real pixels with real HDR boost.
 
 The result is full-resolution: **real face pixels** over a **reconstructed
 background**. The seam between them is hidden by the soft mask.
@@ -452,6 +486,13 @@ What you can recover by hand, and how good it is:
   to the full size, and add it to the upscaled background — the result is a
   faithful (if lossy) background, no AI needed. This is exactly what `facekeep
   restore` does on a residual-bearing file.
+- **The HDR gain map** *(1.10.0+, only if `gain_map_preserved` is true)*.
+  `gainmap.jpg` is the real per-pixel HDR boost map from the original iPhone
+  photo — a plain grayscale JPEG any viewer opens. By hand: brighten the
+  recovered image per pixel by `2^(3 × value/255)` in linear light for the
+  full HDR rendition, or hand the base + map to any gain-map-aware tool
+  (e.g. libavif's `avifgainmaputil combine`) — exactly what `facekeep restore
+  -f avif` does.
 - **A quick preview.** `thumbnail.jpg` is an immediate small preview of the
   whole image.
 - **The color profile** *(1.4.0+)*. If the source was wide-gamut, `icc.bin` is the
@@ -528,7 +569,13 @@ rather than implying it passed.
   `avifenc`, when the residual is on and high-bit storage is engaged) and widened
   `settings.bit_depth` to cover it — older files have no `residual.avif` and a
   reader that ignores it just restores via the normal upscale path (hallucinating
-  the background), exactly as a residual-less file does.
+  the background), exactly as a residual-less file does; `1.10.0` added the
+  optional `gainmap.jpg` member and the top-level `gain_map_preserved` flag
+  (iPhone HDR gain-map preservation — `aggressive.preserve_gain_map`, on by
+  default, stores the map only when the source carried one; `restore -f avif`
+  re-attaches it into a backward-compatible HDR AVIF via `avifgainmaputil`) —
+  older files have neither, and a reader that ignores them restores SDR exactly
+  as before Phase 9.
 - Readers are **tolerant by structure, not by strict schema validation**: they
   locate members by name (`background.(jpg|avif|jxl)`, `face_NNN.*`,
   `face_mask_NNN.png`,

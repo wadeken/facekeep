@@ -232,9 +232,22 @@ def _read_heif_gain_map(himg) -> tuple[Optional[np.ndarray], Optional[dict]]:
         for urn, ids in aux.items():
             if "hdrgainmap" not in urn.lower() or not ids:
                 continue
-            arr = np.asarray(himg.get_aux_image(ids[0]))
+            # LIFETIME LANDMINE (do not "simplify" this into one chained
+            # expression): the aux pixel buffer is libheif-owned, and
+            # np.asarray on a pillow_heif image is a *deferred* zero-copy view
+            # — the actual memory read happens later, after a temporary
+            # HeifAuxImage has been freed, which is a use-after-free access
+            # violation that kills the interpreter (verified on pillow_heif
+            # 1.3.0 AND 1.4.0: `np.asarray(himg.get_aux_image(id)).copy()`
+            # crashes ~always; copy-while-alive passes 18/18). So: bind the
+            # aux image, and copy its pixels immediately via to_pillow()
+            # (Image.frombytes copies while the object is alive).
+            aux_img = himg.get_aux_image(ids[0])
+            arr = np.asarray(aux_img.to_pillow())
             if arr.ndim == 3:  # typically mode "L" (2-D); normalize color to BGR
                 arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            else:
+                arr = arr.copy()  # own the buffer (PIL's is read-only)
             return arr, {"source": "heic-aux", "urn": urn}
     except (ValueError, OSError, KeyError, IndexError, RuntimeError) as e:
         logger.debug("Could not read HEIC gain map (%s)", e)

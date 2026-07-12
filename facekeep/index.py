@@ -114,6 +114,10 @@ def settings_fingerprint(config: FaceKeepConfig) -> str:
             "conservative_bg_scale": config.aggressive.conservative_bg_scale,
             "text_edge_threshold": config.aggressive.text_edge_threshold,
             "small_face_ratio": config.aggressive.small_face_ratio,
+            # Gain-map preservation adds/removes the gainmap.jpg member (and
+            # the manifest flag), so it changes the output bytes and must bust
+            # the cache. (gain_map_headroom is restore-only — not fingerprinted.)
+            "preserve_gain_map": config.aggressive.preserve_gain_map,
             # Text protection emits region patches for localized text-like
             # clusters (vs the whole-image raise) — whether/where/how-much
             # changes the output bytes, so all three knobs must bust the cache.

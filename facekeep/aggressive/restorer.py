@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 
 from ..config import AggressiveConfig
-from ..exceptions import ModelDownloadError, RestoreError
+from ..exceptions import EncodingError, ModelDownloadError, RestoreError
 from ..models import ensure_weights
 from .blender import _match_dtype, blend_face_onto_background
 from .format import _offset_decode_residual, read_fkeep
@@ -758,7 +758,7 @@ class Restorer:
         return result
 
     def _write(self, result, output_path, exif, *, icc=None, has_faces=False,
-               quality=70, out_bit_depth=8):
+               quality=70, out_bit_depth=8, gain_map=None):
         """Write the restored image to a standard file, format chosen by suffix.
 
         Restore is meant to be the "never a dead end" escape hatch (ROADMAP
@@ -776,6 +776,13 @@ class Restorer:
           write these here) and embeds EXIF *and* ICC through the encoder.
           ``has_faces`` drives ``auto`` chroma to 4:4:4 so restored skin/lips stay
           crisp — the same one face-aware decision faithful mode makes.
+        * ``.avif`` **with a stored HDR gain map** (``gain_map`` not None,
+          manifest 1.10.0+) -> ``encoders.encode_gainmap_avif`` re-attaches the
+          gain map via the external ``avifgainmaputil`` binary, producing a
+          backward-compatible HDR AVIF (EXIF rides along; color is declared as
+          CICP — the tool refuses ICC inputs). Missing binary, a non-avif
+          output, or any re-attach failure falls back to the normal SDR write
+          with a warning — never a hard fail (offline-first).
 
         BGR stays internal: the only BGR->RGB conversions are at the PIL boundary
         here and inside ``encoders.encode``, per the repo convention.
@@ -785,6 +792,45 @@ class Restorer:
         # depth. Only AVIF (via the avifenc CLI) can write it; JPEG/PNG/WebP and
         # the bundled JXL are 8-bit, so those round it down with a clear warning.
         high_bit = result.dtype == np.uint16
+
+        # iPhone HDR gain map (manifest 1.10.0+): re-attach it so the output is
+        # a real HDR AVIF (SDR viewers see the base — backward compatible).
+        # Only the .avif output can carry it, and only via the external
+        # avifgainmaputil binary; every other combination falls through to the
+        # normal SDR write with a warning (offline-first, never a hard fail).
+        if gain_map is not None:
+            if suffix != ".avif":
+                logger.warning(
+                    "This .fkeep carries an HDR gain map, but only an .avif "
+                    "output can re-attach it; writing SDR %s. Use `restore -f "
+                    "avif` for HDR.", suffix or "output",
+                )
+            else:
+                from .. import encoders
+
+                if not encoders.avifgainmaputil_available():
+                    logger.warning(
+                        "This .fkeep carries an HDR gain map, but the "
+                        "avifgainmaputil binary was not found (set "
+                        "FACEKEEP_AVIFENC or put the libavif tools on PATH); "
+                        "writing SDR AVIF."
+                    )
+                else:
+                    try:
+                        data = encoders.encode_gainmap_avif(
+                            result, gain_map,
+                            headroom=self.config.gain_map_headroom,
+                            quality=quality, exif=exif, icc=icc,
+                        )
+                        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+                        Path(output_path).write_bytes(data)
+                        return
+                    except EncodingError as e:
+                        logger.warning(
+                            "HDR gain-map re-attach failed (%s); writing SDR "
+                            "AVIF instead.", e,
+                        )
+
         if suffix in (".avif", ".jxl"):
             from .. import encoders
 
@@ -926,7 +972,8 @@ class Restorer:
             self._write(result, output_path, data.get("exif"),
                         icc=data.get("icc"),
                         has_faces=bool(m["faces"]), quality=quality,
-                        out_bit_depth=out_bit_depth)
+                        out_bit_depth=out_bit_depth,
+                        gain_map=data.get("gain_map"))
         return result
 
     def preview(self, fkeep_path: str, output_path: Optional[str] = None,
@@ -938,6 +985,12 @@ class Restorer:
         an enhancement — a preview that omitted it would misrepresent the
         file's content, and the bench bicubic proxy (preview-based) would hide
         the fidelity win. It costs one resize + add, nothing model-sized.
+
+        A stored HDR gain map is NOT re-attached here (the GFPGAN/grain
+        precedent, not the residual one): preview pixels are the same either
+        way — the gain map only affects how an HDR *display* brightens them —
+        and the re-attach costs a full external re-encode, far too slow for an
+        interactive preview. ``restore`` is the HDR path.
         """
         data = read_fkeep(fkeep_path)
         m = data["manifest"]

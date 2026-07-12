@@ -116,7 +116,8 @@ input → detect faces → crop faces (original quality; JPEG q95 by default, or
                         bicubic upscale of the *decoded* background, half-res,
                         offset-encoded as residual.jxl — the "middle mode")
                       → pack into .fkeep (a ZIP: manifest + bg + faces + masks +
-                        region patches [+ residual] + EXIF + ICC profile)
+                        region patches [+ residual] [+ HDR gain map] + EXIF +
+                        ICC profile)
 
 restore: .fkeep → AI super-resolution upscale background (Real-ESRGAN;
                   bicubic fallback) → re-anchor the upscale's low frequencies
@@ -132,6 +133,10 @@ restore: .fkeep → AI super-resolution upscale background (Real-ESRGAN;
                   feathered soft masks → full-resolution standard image (.jpg
                   default via Pillow, or .avif/.jxl; EXIF *and* ICC color profile
                   re-embedded) — so a .fkeep is never a dead end
+                  → (1.10.0+, .avif output only) re-attach the stored iPhone HDR
+                  gain map via avifgainmaputil combine → a backward-compatible
+                  HDR AVIF (SDR viewers see the base; missing binary/other
+                  formats → SDR + warn)
 
          (residual files, 1.6.0+: the background is instead reconstructed from
           REAL data — bicubic upscale + the stored residual delta — and the AI
@@ -430,6 +435,35 @@ box without `avifdec` (the background then hallucinates, as without a residual).
 the shared `avifenc` encode path — `encode_highbit_avif` / `encode_lossless_avif`
 double-applied a BGR→RGB conversion, so faithful mode's 10/12-bit and lossless
 AVIF output had red/blue exchanged; now pinned by a color round-trip test.)*
+
+**iPhone HDR gain-map preservation** (`aggressive.preserve_gain_map`, on by
+default; manifest 1.10.0+) is the *real*-iPhone-HDR path — Phase 9's insight is
+that a modern iPhone HDR still is **not** a 10/12-bit deep-color image but an
+8-bit Display-P3 base plus an Apple HDR **gain map** (an auxiliary image the OS
+multiplies onto the base, scaled to the display's headroom). `imageio.load`
+extracts that gain map (HEIC aux image / JPEG MPF second frame,
+XMP-discriminated); aggressive compress stores it as one small `gainmap.jpg`
+member (grayscale, typically half-resolution — Apple's own native scale) plus a
+`gain_map_preserved` manifest flag, automatically whenever the source carries
+one (the "just preserve it" decision; the flag opts out). On `restore -f avif`
+the gain map is **re-attached**: the restored base is linearized, boosted per
+pixel by `2^(headroom × gain)` (`aggressive.gain_map_headroom`, default 3 stops
+— validated value-for-value against libavif's own conversion of a real iPhone
+photo), PQ-encoded into an HDR alternate, and `avifgainmaputil combine` writes
+a **backward-compatible HDR AVIF** (SDR viewers show the base; HDR displays
+extend the highlights — the same mechanism as the original photo). Graceful
+degradation everywhere (principle 4): a non-`.avif` output, a machine without
+the `avifgainmaputil` binary (the same opt-in `.tools`/PATH family as
+`avifenc`), or any re-attach failure falls back to the normal SDR write with a
+warning — never a hard fail, and `preview()` never re-attaches (an external
+re-encode is too slow for interactive use, and preview *pixels* are identical
+either way). Two honest limits, documented in the format spec: the tool
+rejects ICC-profiled inputs, so output color is declared via CICP (equivalent
+for the P3/sRGB profiles every iPhone uses); and the background under the gain
+map is reconstructed, so its HDR is approximate — the faces/patches are real
+pixels with real HDR boost, the same "plausible, not faithful" bargain the mode
+already makes. `preserve_gain_map` is compress-side → fingerprinted;
+`gain_map_headroom` is restore-only → not.
 
 **Face enhancement of reconstructed background faces** is the restore-side
 safety net for the recall guardrails above. Detection biases toward recall, but

@@ -190,7 +190,7 @@ def test_default_8bit_container_has_no_bit_depth_key(face_image, tmp_path):
     fk = tmp_path / "o.fkeep"
     write_fkeep(photo, str(fk))
     info = read_fkeep_info(str(fk))
-    assert info["version"] == "1.9.0"
+    assert info["version"] == "1.10.0"
     assert "bit_depth" not in info["settings"]  # absent on an 8-bit container
 
 
@@ -236,7 +236,7 @@ def test_highbit_aggressive_roundtrip_preserves_hdr(face_image, tmp_path):
     write_fkeep(photo, str(fk))
 
     info = read_fkeep_info(str(fk))
-    assert info["version"] == "1.9.0"
+    assert info["version"] == "1.10.0"
     assert info["settings"]["bit_depth"] == 10
     with zipfile.ZipFile(str(fk)) as zf:
         assert "face_000.avif" in zf.namelist()
@@ -403,7 +403,7 @@ def test_highbit_residual_roundtrip_preserves_hdr(face_image, tmp_path):
     write_fkeep(photo, str(fk))
 
     info = read_fkeep_info(str(fk))
-    assert info["version"] == "1.9.0"
+    assert info["version"] == "1.10.0"
     assert info["settings"]["residual"] is True
     assert info["settings"]["bit_depth"] == 10  # folded from the high-bit residual
     with zipfile.ZipFile(str(fk)) as zf:
