@@ -583,7 +583,14 @@ documented in [fkeep-format.md](fkeep-format.md).
   `source_bit_depth=16`), so it feeds the `avifenc` 10/12-bit AVIF output path
   instead of being flattened to 8-bit; HEIC uses `open_heif` *exclusively* (never
   PIL `Image.open`) because opening one HEIC with both APIs in a process
-  segfaults libheif.
+  segfaults libheif. It also carries the **iPhone HDR gain map** (Phase 9.1): a
+  HEIC's `…aux:hdrgainmap` auxiliary image (exposed via
+  `pillow_heif.options.AUX_IMAGES`) or a JPEG's MPF second frame (accepted only
+  when its XMP names a gain map, so a stereo MPO is never misread) rides
+  `LoadedImage.gain_map` / `gain_map_meta`, kept upright and aligned with the
+  base pixels. Extraction is best-effort (`None` on any failure — a gain map
+  never fails a load); nothing consumes it yet — storing and re-attaching it is
+  Phase 9.2.
 - **faithful.py** — the default pipeline.
 - **index.py** — incremental-processing cache (stdlib `sqlite3`): records each
   file's content hash + settings fingerprint + output path so a re-run skips

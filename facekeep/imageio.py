@@ -5,6 +5,13 @@ GPS, camera info, and (b) leaves rotated phone photos in the wrong orientation
 so face detection runs on a sideways image. This module loads the image,
 physically applies the EXIF orientation, and carries the EXIF bytes through so
 they can be re-embedded on output.
+
+It also carries the **HDR gain map** when the source has one (Phase 9): a
+modern iPhone HDR still is an 8-bit Display-P3 base plus an Apple gain map
+(HEIC: the ``…aux:hdrgainmap`` auxiliary image; JPEG: an MPF second frame whose
+XMP names the gain map), *not* a 10/12-bit deep-color image. The gain map is
+extracted best-effort onto ``LoadedImage.gain_map`` so downstream stages can
+preserve it; nothing consumes it yet, so loading alone changes no output.
 """
 
 import logging
@@ -53,6 +60,14 @@ class LoadedImage:
     # true 10/12-bit avifenc AVIF output path. Without the avifenc binary (or for
     # JXL/WebP) it rounds down to 8-bit at the encode boundary with a loud warning
     # (never a silent truncation).
+    gain_map: Optional[np.ndarray] = None  # HDR gain map (iPhone HDR): typically a
+    # single-channel uint8 array at half the base resolution, kept UPRIGHT (it is
+    # rotated together with the base image, so the two stay aligned). None when
+    # the source carries none. Carried for preservation (Phase 9); nothing in the
+    # pipeline consumes it yet.
+    gain_map_meta: Optional[dict] = None  # informational: {"source": "heic-aux",
+    # "urn": <aux type URN>} or {"source": "jpeg-mpf", "frame_index": int,
+    # "xmp": <the gain-map frame's raw XMP bytes>}. None when gain_map is None.
 
 
 def _strip_gps_from_exif(exif_bytes: Optional[bytes]) -> Optional[bytes]:
@@ -193,10 +208,81 @@ def _normalize_to_bgr(image: np.ndarray) -> np.ndarray:
     return image  # already 3-channel BGR
 
 
-def _decode_heif(path: Path) -> tuple[np.ndarray, int, Optional[bytes], Optional[bytes]]:
+# Substrings that identify an MPF frame's XMP as an HDR gain map. "hdrgainmap"
+# matches Apple's URN/namespace (urn:com:apple:photo:2020:aux:hdrgainmap,
+# xmlns:HDRGainMap); "hdr-gain-map" matches the Adobe/ISO namespace
+# (ns.adobe.com/hdr-gain-map). Matched case-insensitively.
+_GAIN_MAP_XMP_MARKERS = (b"hdrgainmap", b"hdr-gain-map")
+
+
+def _read_heif_gain_map(himg) -> tuple[Optional[np.ndarray], Optional[dict]]:
+    """Extract the Apple HDR gain map from an opened pillow_heif image, if any.
+
+    Requires ``pillow_heif.options.AUX_IMAGES`` to have been enabled before the
+    file was opened (see ``_decode_heif``); the gain map is then listed in
+    ``info["aux"]`` under the ``…aux:hdrgainmap`` URN and decoded with
+    ``get_aux_image``. libheif returns the aux image already aligned with the
+    (pre-rotated) base pixels, so no orientation fix-up is needed here —
+    verified on a real iPhone HEIC (orientation 6: base and gain map both come
+    back upright portrait). Best-effort: any read failure yields ``(None,
+    None)`` — a gain map must never fail a load.
+    """
+    try:
+        aux = himg.info.get("aux") or {}
+        for urn, ids in aux.items():
+            if "hdrgainmap" not in urn.lower() or not ids:
+                continue
+            arr = np.asarray(himg.get_aux_image(ids[0]))
+            if arr.ndim == 3:  # typically mode "L" (2-D); normalize color to BGR
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            return arr, {"source": "heic-aux", "urn": urn}
+    except (ValueError, OSError, KeyError, IndexError, RuntimeError) as e:
+        logger.debug("Could not read HEIC gain map (%s)", e)
+    return None, None
+
+
+def _read_jpeg_gain_map(path: Path) -> tuple[Optional[np.ndarray], Optional[dict]]:
+    """Extract the HDR gain map from a JPEG's MPF second frame, if any.
+
+    An iPhone HDR JPEG carries the gain map as an MPF (Multi-Picture Format)
+    secondary image; Pillow surfaces such a file as format ``MPO`` with the
+    gain map as frame 1+. A frame is accepted as a gain map only when its XMP
+    names one (``_GAIN_MAP_XMP_MARKERS``), so a stereo-pair MPO is not
+    misread as HDR. The returned array is in the frame's *stored* orientation —
+    ``load()`` rotates it together with the base image (the MPF frame is stored
+    un-rotated exactly like the base pixels). Best-effort: any failure yields
+    ``(None, None)``.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(str(path)) as pil:
+            if pil.format != "MPO" or getattr(pil, "n_frames", 1) < 2:
+                return None, None
+            for frame in range(1, pil.n_frames):
+                pil.seek(frame)
+                xmp = pil.info.get("xmp") or b""
+                if isinstance(xmp, str):
+                    xmp = xmp.encode("utf-8", "ignore")
+                low = bytes(xmp).lower()
+                if not any(marker in low for marker in _GAIN_MAP_XMP_MARKERS):
+                    continue
+                arr = np.asarray(pil)
+                if arr.ndim == 3:  # typically mode "L" (2-D); normalize to BGR
+                    arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                meta = {"source": "jpeg-mpf", "frame_index": frame, "xmp": bytes(xmp)}
+                return arr, meta
+    except (OSError, ValueError, EOFError, struct.error, KeyError) as e:
+        logger.debug("No gain map read for %s (%s)", path.name, e)
+    return None, None
+
+
+def _decode_heif(
+    path: Path,
+) -> tuple[np.ndarray, int, Optional[bytes], Optional[bytes], Optional[np.ndarray], Optional[dict]]:
     """Decode a HEIC/HEIF fully via ``pillow_heif.open_heif`` — never PIL ``Image.open``.
 
-    Returns ``(bgr, source_bit_depth, exif_bytes, icc)``.
+    Returns ``(bgr, source_bit_depth, exif_bytes, icc, gain_map, gain_map_meta)``.
 
     **Why open_heif and never Image.open for HEIC.** Opening the *same* HEIC file
     with both the PIL HEIF plugin (``Image.open``) and ``open_heif`` in one
@@ -230,6 +316,10 @@ def _decode_heif(path: Path) -> tuple[np.ndarray, int, Optional[bytes], Optional
     # keeps the plugin initialized. It opens nothing, so it adds no second
     # libheif context (no dual-API crash).
     pillow_heif.register_heif_opener()
+    # Expose auxiliary images (default off): the Apple HDR gain map lives in an
+    # aux item, and without this flag pillow_heif silently drops it at load —
+    # exactly the fidelity leak Phase 9 fixes. Must be set BEFORE open_heif.
+    pillow_heif.options.AUX_IMAGES = True
     heif_file = pillow_heif.open_heif(str(path), convert_hdr_to_8bit=False)
     himg = heif_file[0]
     arr = np.asarray(himg)  # uint8 (8-bit) or uint16 (HDR); RGB / RGBA / grayscale
@@ -245,11 +335,16 @@ def _decode_heif(path: Path) -> tuple[np.ndarray, int, Optional[bytes], Optional
     # so normalize the carried tag to 1 (the raw value is discarded — the pixels
     # are already upright, so the caller applies orientation 1 = a no-op).
     exif_bytes, _orig_orientation = _normalize_orientation_in_exif(himg.info.get("exif"))
-    return bgr, source_bit_depth, exif_bytes, icc
+    gain_map, gain_map_meta = _read_heif_gain_map(himg)
+    return bgr, source_bit_depth, exif_bytes, icc, gain_map, gain_map_meta
 
 
 def load(path: str, strip_gps: bool = False) -> LoadedImage:
     """Load an image, applying EXIF orientation and preserving EXIF bytes.
+
+    When the source carries an HDR gain map (an iPhone HDR HEIC aux image or
+    JPEG MPF frame), it is extracted best-effort onto ``LoadedImage.gain_map``
+    (upright, aligned with ``image``) so downstream stages can preserve it.
 
     Args:
         path: Path to the image to load.
@@ -270,12 +365,14 @@ def load(path: str, strip_gps: bool = False) -> LoadedImage:
     source_bit_depth = 8
     exif_bytes: Optional[bytes] = None
     orientation = 1
+    gain_map: Optional[np.ndarray] = None
+    gain_map_meta: Optional[dict] = None
     if suffix in {".heic", ".heif"}:
         # HEIC/HEIF: decode via pillow_heif.open_heif ONLY (never PIL Image.open)
         # so a 10/12-bit HDR source keeps its high-bit pixels — see _decode_heif
         # for the full rationale (and why mixing the two APIs on one HEIC crashes).
         try:
-            image, source_bit_depth, exif_bytes, icc = _decode_heif(p)
+            image, source_bit_depth, exif_bytes, icc, gain_map, gain_map_meta = _decode_heif(p)
             # open_heif already applied the orientation (pixels upright) and
             # _decode_heif normalized the carried tag to 1, so the uniform
             # orientation step below must NOT rotate again.
@@ -327,12 +424,22 @@ def load(path: str, strip_gps: bool = False) -> LoadedImage:
         icc = _read_icc(p)
         # piexif handles JPEG/TIFF; safe for the OpenCV-decoded formats.
         exif_bytes, orientation = _read_exif_and_orientation(p)
+        if suffix in {".jpg", ".jpeg"}:
+            # An iPhone HDR JPEG carries its gain map as an MPF second frame
+            # (OpenCV never sees it); other OpenCV formats have no MPF.
+            gain_map, gain_map_meta = _read_jpeg_gain_map(p)
 
     if image is None:
         raise UnsupportedInputError(f"Cannot read image: {path}")
 
     if orientation in _ORIENTATION_OPS:
         image = _ORIENTATION_OPS[orientation](image)
+        if gain_map is not None:
+            # The MPF gain-map frame is stored un-rotated exactly like the base
+            # pixels, so apply the same op to keep the two aligned. (The HEIC
+            # path never gets here: its orientation is forced to 1 and libheif
+            # already returns the aux image aligned with the rotated base.)
+            gain_map = _ORIENTATION_OPS[orientation](gain_map)
 
     if strip_gps:
         exif_bytes = _strip_gps_from_exif(exif_bytes)
@@ -346,4 +453,6 @@ def load(path: str, strip_gps: bool = False) -> LoadedImage:
         height=h,
         icc=icc,
         source_bit_depth=source_bit_depth,
+        gain_map=gain_map,
+        gain_map_meta=gain_map_meta,
     )
