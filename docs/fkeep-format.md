@@ -15,7 +15,7 @@ all** (see [Manual recovery](#manual-recovery-without-facekeep)).
 - **Extension:** `.fkeep`
 - **Container:** a ZIP archive (`zipfile.ZIP_DEFLATED`). Anything that opens a
   `.zip` opens a `.fkeep` — just rename it, or point `unzip` straight at it.
-- **Current manifest version:** `1.10.0` (see [Versioning](#versioning--compatibility)).
+- **Current manifest version:** `1.11.0` (see [Versioning](#versioning--compatibility)).
 
 ---
 
@@ -67,7 +67,7 @@ index (`000`, `001`, …) matching the face's `id` in the manifest (and, for the
 | `region_NNN.(jpg\|avif\|jxl\|png)` | one per region (manifest 1.3.0+; only when region-local conservatism fired) | same codec/precedence as face crops | A **region-local conservatism** patch: a near-original-resolution crop of a risky region — the background around a small/distant face, a **hand**, or a **text-like cluster** (signage; opt-in `protect_text`) — kept sharp instead of downsampled. Readers need no new key: a region is a region. Covers the region's `bbox`. |
 | `region_mask_NNN.png` | one per region | 8-bit grayscale PNG | Soft alpha mask for feathered compositing of the region patch. |
 | `residual.avif` / `residual.jxl` / `residual.jpg` | only when `settings.residual` is true (manifest 1.6.0+) | high-bit (10/12-bit) AVIF when `settings.bit_depth` > 8 (manifest 1.9.0+); else JPEG XL (q = `settings.residual_quality`), or JPEG as a warned fallback when the JXL plugin is unavailable | The **residual layer**: the real high-frequency delta the background downsample lost, at `settings.residual_scale` resolution, offset-encoded (`value/2 + 128` into uint8; high-bit: `value/2 + 32768` into uint16 — see [Image members](#image-members-in-detail)). Restore adds it back to a bicubic upscale, so the background is real (lossy) data, not a hallucination. |
-| `gainmap.jpg` | only when `gain_map_preserved` is true (manifest 1.10.0+) | grayscale JPEG q90 (typically half the original resolution) | The source's **iPhone HDR gain map** (the auxiliary image that makes an iPhone photo HDR — the base image is plain 8-bit SDR). Stored upright (aligned with the original frame). `facekeep restore` re-attaches it on the HDR-capable outputs: the **default `.jpg`** becomes a backward-compatible **Ultra HDR JPEG** (built in, pure Pillow — the stored bytes ride verbatim as the MPF second frame), and `-f avif` becomes an **HDR AVIF** via `avifgainmaputil combine`; any other output (or a machine without the binary, on the AVIF path) restores SDR with a warning. |
+| `gainmap.jpg` | only when `gain_map_preserved` is true (manifest 1.10.0+) | grayscale JPEG q90 (typically half the original resolution) | The source's **HDR gain map** (the auxiliary image that makes an iPhone/Android HDR photo HDR — the base image is plain 8-bit SDR). Stored upright (aligned with the original frame). `facekeep restore` re-attaches it on the HDR-capable outputs: the **default `.jpg`** becomes a backward-compatible **Ultra HDR JPEG** (built in, pure Pillow — the stored bytes ride verbatim as the MPF second frame), and `-f avif` becomes an **HDR AVIF** via `avifgainmaputil combine`; any other output (or a machine without the binary, on the AVIF path) restores SDR with a warning. An Android Ultra HDR source's declared application math rides as the optional `gain_map_params` manifest key (1.11.0+) and is re-emitted on restore; absent = the Apple default semantics. |
 | `exif.bin` | only if the source had EXIF | raw bytes | The original EXIF block, re-embedded into the restored image. |
 | `icc.bin` | only if the source had an ICC profile (manifest 1.4.0+) | raw bytes | The original ICC color profile (e.g. Display P3), re-embedded into the restored image so wide-gamut color survives. |
 
@@ -151,16 +151,18 @@ Notes:
 ## `manifest.json` schema
 
 The manifest is written with `indent=2` and `ensure_ascii=False`. Top-level
-keys (all present on a v1.1.0 file written by the current code):
+keys (all present on a file written by the current code, except the rows
+marked *optional*):
 
 | Key | Type | Meaning |
 | --- | --- | --- |
-| `version` | string | **Manifest schema version** (`"1.9.0"`). Independent of the tool version. |
+| `version` | string | **Manifest schema version** (`"1.11.0"`). Independent of the tool version. |
 | `mode` | string | Always `"aggressive"` (only aggressive mode writes `.fkeep`). |
 | `original` | object | Facts about the original input file — see below. |
 | `exif_preserved` | bool | `true` iff an `exif.bin` member is present. |
 | `icc_preserved` | bool | `true` iff an `icc.bin` member is present (the source had an ICC color profile). *(Added in manifest `1.4.0`; absent on older files.)* |
 | `gain_map_preserved` | bool | `true` iff a `gainmap.jpg` member is present (the source carried an iPhone HDR gain map and `aggressive.preserve_gain_map` was on — the default). *(Added in manifest `1.10.0`; absent on older files.)* |
+| `gain_map_params` | object | *(1.11.0+, optional)* The gain map's **application math as the source declared it** — the Adobe `hdrgm` XMP attributes of an Android Ultra HDR source's gain-map frame, parsed at compress time: `gain_map_min`, `gain_map_max`, `gamma`, `offset_sdr`, `offset_hdr` (each a float, or a 3-list in **RGB** channel order for per-channel maps), `hdr_capacity_min`, `hdr_capacity_max` (floats) and `base_rendition_is_hdr` (bool). Absent attributes are filled from the Adobe spec defaults at parse time, so the stored object is self-contained. `facekeep restore` **re-emits these values** in the output (verbatim in the Ultra HDR JPEG's hdrgm XMP; in the boost math of the `-f avif` path) instead of assuming the Apple semantics — without them a e.g. `GainMapMax=4.5` Android photo would restore at a wrong HDR brightness scale. **Absent entirely** (Apple/HEIC sources, whose maps carry no hdrgm attributes, and all older files) means the Apple default semantics `boost = 2^(headroom × v/255)` — exactly the pre-1.11.0 behavior, so every existing `.fkeep` restores unchanged. |
 | `settings` | object | The aggressive-mode parameters used to produce this file — see below. |
 | `faces` | array | One entry per detected face — see below. May be empty (no faces found). |
 | `regions` | array | One entry per region-local conservatism patch — see below. *(Added in manifest `1.3.0`; absent/empty on older files and on photos with no risky region.)* |
@@ -242,7 +244,7 @@ A real two-face manifest (values illustrative):
 
 ```json
 {
-  "version": "1.10.0",
+  "version": "1.11.0",
   "mode": "aggressive",
   "original": {
     "filename": "2024.05.20_trip.jpg",
@@ -355,15 +357,19 @@ region. `bg_scale` stays at the aggressive `0.25` for the rest of the frame.
     65536`. Restore promotes the upscale to 16-bit and adds the delta, so the
     background comes back at full depth.
 - **`gainmap.jpg`** *(1.10.0+, only when `gain_map_preserved` is true)* — the
-  source's iPhone HDR gain map, carried through from load (HEIC aux image /
+  source's HDR gain map, carried through from load (HEIC aux image /
   JPEG MPF second frame): a single-channel image, typically half the original
   resolution, stored upright (aligned with the original frame — the same
   orientation the restored image has). Grayscale JPEG q90 (Apple itself stores
-  the map lossy). Semantics: `linear boost = 2^(headroom × value/255)` per
-  pixel, with a headroom of ≈3 stops (validated value-for-value against
-  libavif's own conversion of a real iPhone photo). Restore uses it to rebuild
-  the fully-applied HDR alternate and embeds a gain map in the output AVIF via
-  `avifgainmaputil combine`.
+  the map lossy). Default semantics: `linear boost = 2^(headroom × value/255)`
+  per pixel, with a headroom of ≈3 stops (validated value-for-value against
+  libavif's own conversion of a real iPhone photo). When the manifest carries
+  `gain_map_params` *(1.11.0+ — an Android Ultra HDR source)* the source's own
+  hdrgm math applies instead: `logBoost = GainMapMin + (GainMapMax −
+  GainMapMin) × value^(1/Gamma)`, `HDR = (SDR + OffsetSDR) × 2^logBoost −
+  OffsetHDR` (which reduces to the default expression at the Apple-equivalent
+  parameters). Restore uses it to rebuild the fully-applied HDR alternate and
+  embeds a gain map in the output AVIF via `avifgainmaputil combine`.
 
 ---
 
@@ -436,11 +442,17 @@ region. `bg_scale` stays at the aggressive `0.25` for the rest of the frame.
      `hdrgm` parameters on the gain-map frame (`Gamma=1, GainMapMin=0,
      GainMapMax=headroom`, zero offsets — exactly equivalent to the Apple
      `2^(headroom × value/255)` semantics, so the map is carried
-     value-for-value), and a hand-built MPF APP2 index. Any authoring failure
+     value-for-value; when the manifest carries `gain_map_params`, 1.11.0+,
+     the **source's own hdrgm values are re-emitted verbatim** instead, so an
+     Android Ultra HDR photo keeps its declared brightness scale), and a
+     hand-built MPF APP2 index. Any authoring failure
      falls back to the plain SDR JPEG write with a warning.
    - **`.avif` (`restore -f avif`):** the restored base is linearized, boosted
      per pixel by `2^(headroom × gain)` (headroom =
-     `aggressive.gain_map_headroom`, default 3 stops), PQ-encoded into an HDR
+     `aggressive.gain_map_headroom`, default 3 stops) — or, when
+     `gain_map_params` is present (1.11.0+), by the source's own hdrgm
+     application formula (see the `gainmap.jpg` member above) — PQ-encoded
+     into an HDR
      alternate, and `avifgainmaputil combine` writes an **HDR AVIF**. EXIF
      rides along; color is declared via CICP (Display P3 → primaries 12)
      because the tool does not accept ICC-profiled inputs — equivalent for
@@ -505,7 +517,11 @@ What you can recover by hand, and how good it is:
   `gainmap.jpg` is the real per-pixel HDR boost map from the original iPhone
   photo — a plain grayscale JPEG any viewer opens. By hand: brighten the
   recovered image per pixel by `2^(3 × value/255)` in linear light for the
-  full HDR rendition, or hand the base + map to any gain-map-aware tool
+  full HDR rendition (if the manifest has a `gain_map_params` key, 1.11.0+ —
+  an Android source — use its declared math instead: `logBoost = gain_map_min
+  + (gain_map_max − gain_map_min) × (value/255)^(1/gamma)`, `HDR = (SDR +
+  offset_sdr) × 2^logBoost − offset_hdr`), or hand the base + map to any
+  gain-map-aware tool
   (e.g. libavif's `avifgainmaputil combine`, or any Ultra HDR writer) —
   exactly what `facekeep restore` does (`-f avif`, or the default `.jpg`
   which packages base + map as an Ultra HDR JPEG).
@@ -561,7 +577,7 @@ rather than implying it passed.
 
 ## Versioning & compatibility
 
-- **`version`** is the manifest schema version (currently `1.9.0`) and is
+- **`version`** is the manifest schema version (currently `1.11.0`) and is
   separate from `facekeep_version` (the tool version that wrote the file). Schema
   history: `1.2.0` added `settings.face_codec` (AVIF/JXL face crops); `1.3.0`
   added the `regions[]` array and the `region_NNN.*` / `region_mask_NNN.png`
@@ -591,7 +607,13 @@ rather than implying it passed.
   default, stores the map only when the source carried one; `restore -f avif`
   re-attaches it into a backward-compatible HDR AVIF via `avifgainmaputil`) —
   older files have neither, and a reader that ignores them restores SDR exactly
-  as before Phase 9.
+  as before Phase 9; `1.11.0` added the optional top-level `gain_map_params`
+  key (the source's declared hdrgm application math, parsed off an Android
+  Ultra HDR source's gain-map frame XMP and re-emitted on restore — ROADMAP
+  9.4). Apple/HEIC sources and all older files carry no key, which means the
+  Apple default semantics, so a reader that ignores it restores those exactly
+  as before — and even on an Android file the fallback only mis-scales the HDR
+  headroom, never the SDR base.
 - Readers are **tolerant by structure, not by strict schema validation**: they
   locate members by name (`background.(jpg|avif|jxl)`, `face_NNN.*`,
   `face_mask_NNN.png`,

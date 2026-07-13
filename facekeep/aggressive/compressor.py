@@ -630,6 +630,14 @@ class CompressedPhoto:
     # pack byte-identically to a gain-map-less file (manifest flag aside).
     gain_map: Optional[np.ndarray] = None
 
+    # Source hdrgm gain-map parameters (ROADMAP 9.4, manifest 1.11.0+): the
+    # application math an Android Ultra HDR source declared in its gain-map
+    # frame's XMP, parsed by imageio (gain_map_meta["hdrgm"]). Stored as the
+    # optional manifest key `gain_map_params` so restore re-emits them instead
+    # of assuming the Apple semantics. None (Apple/HEIC sources, or no gain
+    # map) adds no key — such manifests read as before.
+    gain_map_params: Optional[dict] = None
+
 
 def compress_photo(
     image_path: str,
@@ -861,4 +869,11 @@ def compress_photo(
         # preserve flag (default on) is set. The loader already aligned it with
         # the upright frame, which is the geometry restore rebuilds.
         gain_map=loaded.gain_map if cfg.preserve_gain_map else None,
+        # Its parsed hdrgm application params (9.4), when the source declared
+        # any (Android Ultra HDR); rides only alongside the map itself.
+        gain_map_params=(
+            (loaded.gain_map_meta or {}).get("hdrgm")
+            if cfg.preserve_gain_map and loaded.gain_map is not None
+            else None
+        ),
     )

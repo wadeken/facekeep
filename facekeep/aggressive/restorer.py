@@ -758,7 +758,8 @@ class Restorer:
         return result
 
     def _write(self, result, output_path, exif, *, icc=None, has_faces=False,
-               quality=70, out_bit_depth=8, gain_map=None, gain_map_jpeg=None):
+               quality=70, out_bit_depth=8, gain_map=None, gain_map_jpeg=None,
+               gain_map_params=None):
         """Write the restored image to a standard file, format chosen by suffix.
 
         Restore is meant to be the "never a dead end" escape hatch (ROADMAP
@@ -791,6 +792,11 @@ class Restorer:
           profile stay on the primary. Any authoring failure falls back to the
           plain SDR JPEG write with a warning. Other formats (``.jxl``/
           ``.png``/``.webp``) cannot carry the map and warn SDR.
+        * On both HDR paths, a manifest ``gain_map_params`` key (1.11.0+,
+          ROADMAP 9.4 — an Android Ultra HDR source's declared hdrgm math) is
+          honored: the JPEG re-emits it verbatim in the output XMP, the AVIF
+          uses it in the boost math. Absent (Apple/HEIC sources, older files)
+          -> the Apple-default semantics, exactly the pre-1.11.0 output.
 
         BGR stays internal: the only BGR->RGB conversions are at the PIL boundary
         here and inside ``encoders.encode``, per the repo convention.
@@ -824,6 +830,7 @@ class Restorer:
                         data = encoders.encode_gainmap_avif(
                             result, gain_map,
                             headroom=self.config.gain_map_headroom,
+                            gain_map_params=gain_map_params,
                             quality=quality, exif=exif, icc=icc,
                         )
                         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -852,6 +859,7 @@ class Restorer:
                         img8,
                         gain_map_jpeg if gain_map_jpeg is not None else gain_map,
                         headroom=self.config.gain_map_headroom,
+                        gain_map_params=gain_map_params,
                         quality=95, exif=exif, icc=icc,
                     )
                     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
@@ -1013,7 +1021,11 @@ class Restorer:
                         has_faces=bool(m["faces"]), quality=quality,
                         out_bit_depth=out_bit_depth,
                         gain_map=data.get("gain_map"),
-                        gain_map_jpeg=data.get("gain_map_jpeg"))
+                        gain_map_jpeg=data.get("gain_map_jpeg"),
+                        # Source hdrgm application math (manifest 1.11.0+,
+                        # 9.4): re-emitted/used at re-attach instead of the
+                        # Apple defaults. Absent on older files -> None.
+                        gain_map_params=m.get("gain_map_params"))
         return result
 
     def preview(self, fkeep_path: str, output_path: Optional[str] = None,

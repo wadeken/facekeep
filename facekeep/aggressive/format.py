@@ -22,7 +22,11 @@ A .fkeep file is a ZIP archive (so anyone can inspect it with `unzip`):
                       the source's iPhone HDR gain map (single-channel JPEG,
                       typically half resolution, upright). Restore re-attaches
                       it into an HDR AVIF (`restore -f avif`) via
-                      avifgainmaputil; manifest flag: gain_map_preserved.
+                      avifgainmaputil; manifest flag: gain_map_preserved. An
+                      Android Ultra HDR source's declared hdrgm application
+                      math rides as the optional manifest key gain_map_params
+                      (1.11.0+, ROADMAP 9.4), re-emitted on restore; absent =
+                      the Apple default semantics.
 """
 
 import hashlib
@@ -524,14 +528,17 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
     )
 
     manifest = {
+        # 1.11.0 added the optional gain_map_params key (the source's hdrgm
+        # application math, re-emitted on restore — ROADMAP 9.4; absent = the
+        # Apple default semantics, so every older file restores unchanged);
         # 1.10.0 added the optional gainmap.jpg member + the gain_map_preserved
         # flag (iPhone HDR gain-map preservation, Phase 9); 1.9.0 made the
         # residual layer high-bit too (residual.avif; manifest bit_depth then
         # covers it); 1.8.0 added settings.bit_depth + high-bit crops; 1.7.0 the
         # optional preset key; 1.6.0 the residual layer. Readers are tolerant by
-        # structure, so older readers restore 1.10.0 files unchanged (one that
+        # structure, so older readers restore 1.11.0 files unchanged (one that
         # ignores gainmap.jpg just restores SDR, exactly as before Phase 9).
-        "version": "1.10.0",
+        "version": "1.11.0",
         "mode": "aggressive",
         "original": {
             "filename": photo.original_filename,
@@ -548,6 +555,8 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
         # True iff a gainmap.jpg member is present (the source carried an iPhone
         # HDR gain map and preserve_gain_map was on). Added in manifest 1.10.0;
         # absent on older files. Same flag family as exif/icc_preserved.
+        # (Its sibling gain_map_params, 1.11.0+, is added post-build below —
+        # only when the source declared hdrgm application math.)
         "gain_map_preserved": gain_map_payload is not None,
         "settings": {
             "bg_scale": photo.effective_bg_scale,
@@ -604,6 +613,17 @@ def write_fkeep(photo: CompressedPhoto, output_path: str,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "facekeep_version": __version__,
     }
+
+    # Source hdrgm gain-map parameters (manifest 1.11.0+, ROADMAP 9.4): the
+    # application math an Android Ultra HDR source declared (GainMapMin/Max,
+    # Gamma, offsets, capacities — floats or RGB-ordered 3-lists, plus the
+    # BaseRenditionIsHDR bool). Restore re-emits them verbatim in the output
+    # XMP (JPEG) / uses them in the boost math (AVIF) instead of assuming the
+    # Apple semantics. Added only when a gain map is stored AND the source
+    # declared params — absent (Apple/HEIC sources, all older files) means the
+    # Apple defaults, so every existing .fkeep restores unchanged.
+    if gain_map_payload is not None and photo.gain_map_params:
+        manifest["gain_map_params"] = photo.gain_map_params
 
     # Preset (manifest 1.7.0+): the aggressive-mode preset this file was
     # compressed with, when one was used — informational plus a restore hint

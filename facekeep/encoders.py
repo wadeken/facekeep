@@ -387,11 +387,65 @@ def _pq_oetf(nits: np.ndarray) -> np.ndarray:
     return ((c1 + c2 * lm1) / (1 + c3 * lm1)) ** m2
 
 
+def _hdrgm_channel_array(value, default) -> np.ndarray:
+    """One hdrgm parameter as a broadcastable array: scalar, or a per-channel
+    3-list (stored in the spec's **RGB** order) flipped to the internal BGR."""
+    if value is None:
+        value = default
+    if isinstance(value, (list, tuple)):
+        return np.array([float(v) for v in value][::-1], np.float32).reshape(1, 1, -1)
+    return np.float32(value)
+
+
+def _apply_gain_map(
+    base_lin: np.ndarray,
+    gain: np.ndarray,
+    headroom: float,
+    params: Optional[dict] = None,
+) -> np.ndarray:
+    """Fully-applied HDR alternate in linear light (SDR-relative, >= 0).
+
+    Without ``params`` this is the 9.2-validated Apple semantics ``base *
+    2^(headroom * gain)`` (the expression is kept verbatim so that path stays
+    numerically identical). With the source's parsed hdrgm parameters (ROADMAP
+    9.4 — an Android Ultra HDR source) the full Adobe/Ultra HDR application
+    formula runs instead, at full weight (the alternate *is* the
+    fully-applied rendition)::
+
+        logBoost = GainMapMin + (GainMapMax - GainMapMin) * gain^(1/Gamma)
+        HDR = (SDR + OffsetSDR) * 2^logBoost - OffsetHDR
+
+    which reduces to the Apple expression at the default parameters.
+    Per-channel (3-list) parameters broadcast against the gain map.
+    **Documented approximation:** a source declaring ``BaseRenditionIsHDR``
+    (the primary is the HDR rendition — unseen in the wild from phone
+    writers) inverts the map's direction; rather than guess, that case warns
+    and falls back to the Apple-default boost. The JPEG restore path is
+    unaffected either way (it re-emits the metadata verbatim, no math).
+    """
+    if params is None or params.get("base_rendition_is_hdr"):
+        if params is not None:
+            logger.warning(
+                "Source gain map declares BaseRenditionIsHDR — unsupported by "
+                "the AVIF re-attach math; approximating with the default "
+                "headroom boost."
+            )
+        return base_lin * (2.0 ** (float(headroom) * gain))
+    gmin = _hdrgm_channel_array(params.get("gain_map_min"), 0.0)
+    gmax = _hdrgm_channel_array(params.get("gain_map_max"), headroom)
+    gamma = np.maximum(_hdrgm_channel_array(params.get("gamma"), 1.0), 1e-6)
+    off_sdr = _hdrgm_channel_array(params.get("offset_sdr"), 0.0)
+    off_hdr = _hdrgm_channel_array(params.get("offset_hdr"), 0.0)
+    log_boost = gmin + (gmax - gmin) * np.power(gain, 1.0 / gamma)
+    return np.clip((base_lin + off_sdr) * np.exp2(log_boost) - off_hdr, 0.0, None)
+
+
 def encode_gainmap_avif(
     image_bgr: np.ndarray,
     gain_map: np.ndarray,
     *,
     headroom: float = 3.0,
+    gain_map_params: Optional[dict] = None,
     quality: int = 70,
     gain_map_quality: int = 75,
     exif: Optional[bytes] = None,
@@ -426,7 +480,14 @@ def encode_gainmap_avif(
             construction).
         gain_map: The stored gain map (2-D uint8, any resolution; a 3-channel
             BGR map is applied per channel). Resized to the base size.
-        headroom: HDR headroom in stops (``aggressive.gain_map_headroom``).
+        headroom: HDR headroom in stops (``aggressive.gain_map_headroom``) —
+            the fallback boost when ``gain_map_params`` is None.
+        gain_map_params: The source's parsed hdrgm parameters (manifest
+            ``gain_map_params``, ROADMAP 9.4). When present the HDR alternate
+            is rebuilt with the source's own application math (see
+            :func:`_apply_gain_map`) instead of the fixed Apple semantics, so
+            an Android Ultra HDR source restores at its declared brightness
+            scale.
         quality: 0-100 quality for the base/alternate color.
         gain_map_quality: 0-100 quality for the embedded gain map.
         exif: Optional EXIF bytes to carry into the output.
@@ -460,8 +521,9 @@ def encode_gainmap_avif(
         gain = gain[..., None]
 
     # Rebuild the fully-applied HDR alternate: linear boost, PQ-encoded 16-bit.
+    # Apple-default boost, or the source's own hdrgm math when params rode in.
     base_lin = _srgb_eotf(image_bgr.astype(np.float32) / 255.0)
-    alt_lin = base_lin * (2.0 ** (float(headroom) * gain))
+    alt_lin = _apply_gain_map(base_lin, gain, headroom, gain_map_params)
     alt_pq = _pq_oetf(alt_lin * _GAINMAP_SDR_WHITE_NITS)
     alt16 = np.round(alt_pq * 65535.0).astype(np.uint16)
 
@@ -538,28 +600,73 @@ def encode_gainmap_avif(
 _JPEG_XMP_NS = b"http://ns.adobe.com/xap/1.0/\x00"
 
 
-def _hdrgm_xmp(headroom: float) -> bytes:
+def _fmt_hdrgm(value) -> str:
+    """One hdrgm XMP value as text: floats via repr (minimal, round-trips)."""
+    if isinstance(value, bool):
+        return "True" if value else "False"
+    return repr(float(value))
+
+
+def _hdrgm_xmp(headroom: float, params: Optional[dict] = None) -> bytes:
     """Adobe hdrgm XMP packet for the gain-map frame.
 
-    The values mirror the 9.2-validated Apple semantics ``boost =
-    2^(headroom * v/255)`` exactly: with ``Gamma=1``, ``GainMapMin=0``,
-    ``GainMapMax=headroom`` and zero offsets, the hdrgm application formula
-    reduces to the same expression — so the stored gain-map pixels ride
-    value-for-value, no resampling or math.
+    Without ``params`` the values mirror the 9.2-validated Apple semantics
+    ``boost = 2^(headroom * v/255)`` exactly: with ``Gamma=1``,
+    ``GainMapMin=0``, ``GainMapMax=headroom`` and zero offsets, the hdrgm
+    application formula reduces to the same expression — so the stored
+    gain-map pixels ride value-for-value, no resampling or math.
+
+    With the source's parsed hdrgm parameters (ROADMAP 9.4 — an Android Ultra
+    HDR source, manifest ``gain_map_params``) those values are **re-emitted**
+    instead, so the output declares the same application math the source did
+    (the fixed Apple values would restore e.g. a ``GainMapMax=4.5`` photo at
+    the wrong HDR brightness scale). A scalar re-emits as an attribute; a
+    per-channel 3-list (RGB order, as parsed) as the element form's
+    ``rdf:Seq`` — the two spellings readers accept.
     """
+    if params is None:
+        h = float(headroom)
+        return (
+            '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
+            '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+            '<rdf:Description rdf:about=""'
+            ' xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"'
+            ' hdrgm:Version="1.0"'
+            f' hdrgm:GainMapMin="0.0" hdrgm:GainMapMax="{h}"'
+            ' hdrgm:Gamma="1.0"'
+            ' hdrgm:OffsetSDR="0.0" hdrgm:OffsetHDR="0.0"'
+            f' hdrgm:HDRCapacityMin="0.0" hdrgm:HDRCapacityMax="{h}"'
+            ' hdrgm:BaseRenditionIsHDR="False"/>'
+            "</rdf:RDF></x:xmpmeta>"
+        ).encode()
+
     h = float(headroom)
+    fields = (
+        ("GainMapMin", params.get("gain_map_min", 0.0)),
+        ("GainMapMax", params.get("gain_map_max", h)),
+        ("Gamma", params.get("gamma", 1.0)),
+        ("OffsetSDR", params.get("offset_sdr", 0.0)),
+        ("OffsetHDR", params.get("offset_hdr", 0.0)),
+        ("HDRCapacityMin", params.get("hdr_capacity_min", 0.0)),
+        ("HDRCapacityMax", params.get("hdr_capacity_max", h)),
+        ("BaseRenditionIsHDR", bool(params.get("base_rendition_is_hdr", False))),
+    )
+    attrs = ' hdrgm:Version="1.0"'
+    children = ""
+    for name, value in fields:
+        if isinstance(value, (list, tuple)):
+            lis = "".join(f"<rdf:li>{_fmt_hdrgm(v)}</rdf:li>" for v in value)
+            children += f"<hdrgm:{name}><rdf:Seq>{lis}</rdf:Seq></hdrgm:{name}>"
+        else:
+            attrs += f' hdrgm:{name}="{_fmt_hdrgm(value)}"'
     return (
         '<x:xmpmeta xmlns:x="adobe:ns:meta/">'
         '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
         '<rdf:Description rdf:about=""'
         ' xmlns:hdrgm="http://ns.adobe.com/hdr-gain-map/1.0/"'
-        ' hdrgm:Version="1.0"'
-        f' hdrgm:GainMapMin="0.0" hdrgm:GainMapMax="{h}"'
-        ' hdrgm:Gamma="1.0"'
-        ' hdrgm:OffsetSDR="0.0" hdrgm:OffsetHDR="0.0"'
-        f' hdrgm:HDRCapacityMin="0.0" hdrgm:HDRCapacityMax="{h}"'
-        ' hdrgm:BaseRenditionIsHDR="False"/>'
-        "</rdf:RDF></x:xmpmeta>"
+        + attrs
+        + (f">{children}</rdf:Description>" if children else "/>")
+        + "</rdf:RDF></x:xmpmeta>"
     ).encode()
 
 
@@ -658,6 +765,7 @@ def encode_gainmap_jpeg(
     gain_map: Union[np.ndarray, bytes, bytearray],
     *,
     headroom: float = 3.0,
+    gain_map_params: Optional[dict] = None,
     quality: int = 95,
     exif: Optional[bytes] = None,
     icc: Optional[bytes] = None,
@@ -687,7 +795,14 @@ def encode_gainmap_jpeg(
             accepted and re-encoded as grayscale JPEG q90 (the member's own
             settings).
         headroom: HDR headroom in stops (``aggressive.gain_map_headroom``) —
-            written into the hdrgm metadata, never applied to pixels.
+            written into the hdrgm metadata, never applied to pixels. The
+            fallback when ``gain_map_params`` is None.
+        gain_map_params: The source's parsed hdrgm parameters (manifest
+            ``gain_map_params``, ROADMAP 9.4). When present they are
+            re-emitted **verbatim** in the gain-map frame's hdrgm XMP instead
+            of the fixed Apple-semantics values, so an Android Ultra HDR
+            source keeps its declared application math (still no pixel math
+            on this path — only the metadata changes).
         quality: JPEG quality for the primary frame.
         exif: Optional EXIF bytes for the primary frame.
         icc: Optional ICC profile bytes for the primary frame.
@@ -740,7 +855,7 @@ def encode_gainmap_jpeg(
     # Gain-map frame: splice the hdrgm XMP APP1 into the stored JPEG bytes.
     gm_apps, _ = _jpeg_leading_app_end(gm_jpeg)
     gm_frame = (
-        gm_jpeg[:gm_apps] + _jpeg_xmp_app1(_hdrgm_xmp(headroom))
+        gm_jpeg[:gm_apps] + _jpeg_xmp_app1(_hdrgm_xmp(headroom, gain_map_params))
         + gm_jpeg[gm_apps:]
     )
 

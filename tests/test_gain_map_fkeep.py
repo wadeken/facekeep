@@ -2,7 +2,7 @@
 
 Compress stores the gain map ``imageio.load`` extracted (9.1) as a
 ``gainmap.jpg`` member + a ``gain_map_preserved`` manifest flag (schema
-1.10.0); ``verify_fkeep`` requires a *declared* gain map to decode; restore
+1.10.0, hdrgm params 1.11.0); ``verify_fkeep`` requires a *declared* gain map to decode; restore
 re-attaches it into a backward-compatible HDR AVIF via the external
 ``avifgainmaputil`` binary when the output is ``.avif`` and the binary is
 locatable, or (ROADMAP 9.3) into an **Ultra HDR JPEG** via pure Pillow when
@@ -79,7 +79,7 @@ def hdr_jpeg(tmp_path):
 
 
 def test_fkeep_stores_gain_map(hdr_jpeg, tmp_path):
-    """A gain-map source produces gainmap.jpg + the manifest flag (1.10.0)."""
+    """A gain-map source produces gainmap.jpg + the manifest flag (schema now 1.11.0)."""
     fkeep = _compress_to_fkeep(hdr_jpeg, tmp_path)
 
     with zipfile.ZipFile(fkeep) as zf:
@@ -87,7 +87,7 @@ def test_fkeep_stores_gain_map(hdr_jpeg, tmp_path):
         manifest = json.loads(zf.read("manifest.json"))
     assert "gainmap.jpg" in names
     assert manifest["gain_map_preserved"] is True
-    assert manifest["version"] == "1.10.0"
+    assert manifest["version"] == "1.11.0"
 
 
 def test_gain_map_roundtrip_values(hdr_jpeg, tmp_path):

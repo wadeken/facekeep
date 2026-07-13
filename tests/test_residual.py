@@ -188,13 +188,13 @@ def test_offset_encode_clips_to_uint8_range():
 @requires_jxl
 def test_residual_member_and_manifest(tmp_path):
     """residual=True stores residual.jxl; the manifest flags it (the residual
-    keys landed at 1.6.0; the current writer schema is 1.10.0)."""
+    keys landed at 1.6.0; the current writer schema is 1.11.0)."""
     photo = _photo_with_residual(_detailed_original())
     fkeep = _write(photo, tmp_path, "res")
 
     assert _residual_member(fkeep) == "residual.jxl"
     info = read_fkeep_info(str(fkeep))
-    assert info["version"] == "1.10.0"
+    assert info["version"] == "1.11.0"
     assert info["settings"]["residual"] is True
     assert info["settings"]["residual_scale"] == 0.5
     assert info["settings"]["residual_quality"] == 60
@@ -202,13 +202,13 @@ def test_residual_member_and_manifest(tmp_path):
 
 def test_default_writes_no_residual_member(tmp_path):
     """The default (residual off) writes no member and flags False — but the
-    schema version is still 1.10.0 (it describes the writer, like 1.5.0 did)."""
+    schema version is still 1.11.0 (it describes the writer, like 1.5.0 did)."""
     photo = _photo_with_residual(_detailed_original(480, 320), residual=False)
     fkeep = _write(photo, tmp_path, "plain")
 
     assert _residual_member(fkeep) is None
     info = read_fkeep_info(str(fkeep))
-    assert info["version"] == "1.10.0"
+    assert info["version"] == "1.11.0"
     assert info["settings"]["residual"] is False
 
 

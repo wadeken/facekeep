@@ -1109,6 +1109,14 @@ def info(fkeep_path):
         click.echo(
             "HDR gainmap: yes (restore to .avif re-attaches it -> HDR output)"
         )
+        if m.get("gain_map_params"):
+            # Source-declared hdrgm application math (manifest 1.11.0+, an
+            # Android Ultra HDR source) — restore re-emits it verbatim.
+            gm_max = m["gain_map_params"].get("gain_map_max")
+            click.echo(
+                f"  hdrgm:     source parameters recorded (GainMapMax {gm_max})"
+                " - re-emitted on restore"
+            )
     click.echo(f"Created:     {m.get('created_at', 'N/A')}")
     click.echo(f"FaceKeep:    v{m.get('facekeep_version', 'N/A')}")
 

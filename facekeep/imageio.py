@@ -18,6 +18,7 @@ re-attaches it — 9.2 AVIF, 9.3 Ultra HDR JPEG).
 import io
 import logging
 import struct
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -70,6 +71,11 @@ class LoadedImage:
     gain_map_meta: Optional[dict] = None  # informational: {"source": "heic-aux",
     # "urn": <aux type URN>} or {"source": "jpeg-mpf", "frame_index": int,
     # "xmp": <the gain-map frame's raw XMP bytes>}. None when gain_map is None.
+    # The jpeg-mpf form additionally carries "hdrgm": the parsed Adobe hdrgm
+    # gain-map parameters (see parse_hdrgm_xmp) when the frame's XMP declares
+    # them — an Android Ultra HDR source's application math (ROADMAP 9.4).
+    # Absent (an Apple frame XMP has no hdrgm attributes; HEIC has no XMP at
+    # all) means the Apple default semantics ``boost = 2^(headroom * v/255)``.
 
 
 def _strip_gps_from_exif(exif_bytes: Optional[bytes]) -> Optional[bytes]:
@@ -216,6 +222,98 @@ def _normalize_to_bgr(image: np.ndarray) -> np.ndarray:
 # (ns.adobe.com/hdr-gain-map). Matched case-insensitively.
 _GAIN_MAP_XMP_MARKERS = (b"hdrgainmap", b"hdr-gain-map")
 
+# Adobe hdrgm gain-map namespace (Android Ultra HDR uses it too) + RDF.
+_HDRGM_NS = "http://ns.adobe.com/hdr-gain-map/1.0/"
+_RDF_NS = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+
+
+def _hdrgm_number(raw: str) -> float:
+    """Parse one hdrgm XMP value: plain decimal or a ``num/den`` rational."""
+    s = raw.strip()
+    if "/" in s:
+        num, den = s.split("/", 1)
+        return float(num) / float(den)
+    return float(s)
+
+
+def parse_hdrgm_xmp(xmp) -> Optional[dict]:
+    """Parse Adobe hdrgm gain-map parameters out of an XMP packet (ROADMAP 9.4).
+
+    An Android Ultra HDR JPEG's gain-map frame declares its application math in
+    the ``http://ns.adobe.com/hdr-gain-map/1.0/`` namespace (GainMapMin/Max,
+    Gamma, OffsetSDR/HDR, HDRCapacityMin/Max, BaseRenditionIsHDR) — values our
+    restore must re-emit instead of assuming the fixed Apple semantics, or the
+    restored HDR brightness scale is wrong. Both XMP spellings are accepted:
+    attributes on an ``rdf:Description`` and element form; a **per-channel**
+    value (an ``rdf:Seq`` of 3, seen in the wild) parses to a 3-item list in
+    the spec's **RGB** channel order.
+
+    Returns a manifest-ready dict (floats / RGB-ordered 3-lists / a bool),
+    with absent attributes filled from the Adobe spec defaults (GainMapMin 0,
+    Gamma 1, OffsetSDR/HDR 1/64, HDRCapacityMin 0; HDRCapacityMax defaults to
+    the max GainMapMax) — or ``None`` when the packet carries no parseable
+    ``GainMapMax`` (the one required attribute; an Apple frame XMP, which only
+    *names* the map, lands here). Best-effort like the rest of the gain-map
+    chain: any malformed input yields ``None``, never an exception.
+    """
+    try:
+        blob = bytes(xmp)
+        start = blob.find(b"<x:xmpmeta")
+        end = blob.rfind(b"</x:xmpmeta>")
+        if start < 0 or end < 0:
+            return None
+        root = ET.fromstring(blob[start:end + len(b"</x:xmpmeta>")].decode("utf-8", "ignore"))
+    except (ET.ParseError, ValueError, TypeError, UnicodeDecodeError):
+        return None
+
+    prefix = "{" + _HDRGM_NS + "}"
+    raw: dict = {}
+    for el in root.iter():
+        for key, value in el.attrib.items():
+            if key.startswith(prefix):
+                raw.setdefault(key[len(prefix):], value)
+        if isinstance(el.tag, str) and el.tag.startswith(prefix):
+            name = el.tag[len(prefix):]
+            seq = el.find(f"{{{_RDF_NS}}}Seq")
+            if seq is not None:
+                items = [li.text or "" for li in seq.findall(f"{{{_RDF_NS}}}li")]
+                if items:
+                    raw.setdefault(name, items)
+            elif el.text and el.text.strip():
+                raw.setdefault(name, el.text)
+    if "GainMapMax" not in raw:
+        return None
+
+    def number(name: str, default):
+        value = raw.get(name)
+        if value is None:
+            return default
+        if isinstance(value, list):
+            return [_hdrgm_number(v) for v in value]
+        return _hdrgm_number(value)
+
+    try:
+        gmax = number("GainMapMax", None)
+        gamma = number("Gamma", 1.0)
+        gammas = gamma if isinstance(gamma, list) else [gamma]
+        if any(g <= 0 for g in gammas):
+            return None  # nonsensical; fall back to the Apple defaults
+        return {
+            "gain_map_min": number("GainMapMin", 0.0),
+            "gain_map_max": gmax,
+            "gamma": gamma,
+            "offset_sdr": number("OffsetSDR", 1.0 / 64),
+            "offset_hdr": number("OffsetHDR", 1.0 / 64),
+            "hdr_capacity_min": number("HDRCapacityMin", 0.0),
+            "hdr_capacity_max": number(
+                "HDRCapacityMax", max(gmax) if isinstance(gmax, list) else gmax
+            ),
+            "base_rendition_is_hdr":
+                str(raw.get("BaseRenditionIsHDR", "False")).strip().lower() == "true",
+        }
+    except (ValueError, ZeroDivisionError, TypeError):
+        return None
+
 
 def _read_heif_gain_map(himg) -> tuple[Optional[np.ndarray], Optional[dict]]:
     """Extract the Apple HDR gain map from an opened pillow_heif image, if any.
@@ -307,6 +405,9 @@ def _gain_map_from_frame(frame_bytes: bytes, frame_index: int):
     if arr.ndim == 3:  # typically mode "L" (2-D); normalize to BGR
         arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
     meta = {"source": "jpeg-mpf", "frame_index": frame_index, "xmp": bytes(xmp)}
+    hdrgm = parse_hdrgm_xmp(xmp)  # Android/Adobe application params (9.4)
+    if hdrgm:
+        meta["hdrgm"] = hdrgm
     return arr, meta
 
 
@@ -349,6 +450,9 @@ def _read_jpeg_gain_map(path: Path) -> tuple[Optional[np.ndarray], Optional[dict
                         arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
                     meta = {"source": "jpeg-mpf", "frame_index": frame,
                             "xmp": bytes(xmp)}
+                    hdrgm = parse_hdrgm_xmp(xmp)  # Android/Adobe params (9.4)
+                    if hdrgm:
+                        meta["hdrgm"] = hdrgm
                     return arr, meta
                 return None, None
 

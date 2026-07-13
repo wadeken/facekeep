@@ -78,8 +78,8 @@ def test_fkeep_stores_icc_member_and_flag(p3_photo, tmp_path):
     write_fkeep(photo, str(out))
 
     m = read_fkeep_info(str(out))
-    # ICC landed at 1.4.0; the current schema is 1.10.0 (the gain-map bump).
-    assert m["version"] == "1.10.0"
+    # ICC landed at 1.4.0; the current schema is 1.11.0 (the gain-map params bump).
+    assert m["version"] == "1.11.0"
     assert m["icc_preserved"] is True
     with zipfile.ZipFile(str(out)) as z:
         assert "icc.bin" in z.namelist()

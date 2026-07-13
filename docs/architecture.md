@@ -475,6 +475,23 @@ original photo), by two paths:
   against libavif's own conversion of a real iPhone photo), PQ-encoded into an
   HDR alternate, and `avifgainmaputil combine` writes the gain-map AVIF.
 
+**Android Ultra HDR sources keep their declared math (9.4).** An Android
+Ultra HDR JPEG rides the same MPF chain in, but unlike an Apple map its
+gain-map frame's XMP *declares* the application parameters (Adobe hdrgm:
+GainMapMin/Max, Gamma, offsets, capacities — possibly per-channel), and they
+are routinely non-Apple (e.g. `GainMapMax=4.5`, `Gamma≠1`). Assuming the fixed
+Apple semantics there would restore the HDR at a wrong brightness scale — so
+`imageio.parse_hdrgm_xmp` parses them at load (best-effort, attribute and
+element/`rdf:Seq` forms, spec defaults filled), compress records them as the
+optional manifest key `gain_map_params` (1.11.0+), and restore honors them:
+the Ultra HDR JPEG **re-emits the values verbatim** in its output XMP (still
+zero pixel math), and the AVIF path runs the full hdrgm formula in its boost
+math (`(SDR + OffsetSDR) × 2^{Min + (Max−Min)·v^{1/Gamma}} − OffsetHDR`, which
+reduces to the Apple expression at the default parameters — that path stays
+numerically identical). No key — an Apple/HEIC source (their maps declare no
+hdrgm math), or any pre-1.11.0 file — means the Apple defaults, byte-identical
+to before; params derive from source content, so nothing new is fingerprinted.
+
 Graceful degradation everywhere (principle 4): a non-HDR-capable output
 (`.jxl`/`.png`/`.webp`), a machine without the `avifgainmaputil` binary on the
 AVIF path (the same opt-in `.tools`/PATH family as `avifenc`), or any
@@ -483,10 +500,13 @@ re-attach/authoring failure falls back to the normal SDR write with a warning
 interactive use, and preview *pixels* are identical either way). Honest
 limits, documented in the format spec: the AVIF tool rejects ICC-profiled
 inputs, so that path declares color via CICP (equivalent for the P3/sRGB
-profiles every iPhone uses; the JPEG path embeds the real profile); and the
+profiles every iPhone uses; the JPEG path embeds the real profile); the
 background under the gain map is reconstructed, so its HDR is approximate —
 the faces/patches are real pixels with real HDR boost, the same "plausible,
-not faithful" bargain the mode already makes. `preserve_gain_map` is
+not faithful" bargain the mode already makes; and a source declaring
+`BaseRenditionIsHDR` (unseen from phone writers) is carried verbatim on the
+JPEG path but approximated with the default boost (warned) on the AVIF path.
+`preserve_gain_map` is
 compress-side → fingerprinted; `gain_map_headroom` is restore-only → not.
 
 **Face enhancement of reconstructed background faces** is the restore-side
@@ -654,6 +674,10 @@ documented in [fkeep-format.md](fkeep-format.md).
   JPEG still carries an MPF APP2 the MP index is parsed directly
   (`_parse_mpf_index`) and the secondary frames decoded standalone — FaceKeep
   reads back its own restore output *and* real Pixel/Android Ultra HDR photos.
+  The gain-map frame's declared hdrgm application parameters are parsed too
+  (`parse_hdrgm_xmp`, 9.4 — best-effort, `None` when absent/malformed) onto
+  `gain_map_meta["hdrgm"]`, so an Android source's math survives to the
+  manifest (`gain_map_params`, 1.11.0+) and is honored on restore.
 - **faithful.py** — the default pipeline.
 - **index.py** — incremental-processing cache (stdlib `sqlite3`): records each
   file's content hash + settings fingerprint + output path so a re-run skips
