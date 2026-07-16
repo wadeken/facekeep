@@ -42,5 +42,13 @@ class SkipFileError(FaceKeepError):
     """Raised to signal a file should be skipped (not a hard error)."""
 
 
+class VideoError(FaceKeepError):
+    """Raised when video probing or re-encoding fails.
+
+    Also raised when the external ffmpeg/ffprobe binaries are unavailable —
+    with an install hint, so the CLI surfaces it as a message, not a crash.
+    Photos never touch the video path, so they are unaffected."""
+
+
 class UnsupportedInputError(FaceKeepError):
     """Raised when an input file format is not supported."""
