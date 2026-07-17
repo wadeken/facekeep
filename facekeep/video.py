@@ -432,13 +432,17 @@ def _vmaf_frame_scores(ffmpeg: str, distorted: Path, reference: Path, *,
     lavfi = (f"[0:v]{scale}settb=AVTB,setpts=N/(30*TB)[d];"
              f"[1:v]{scale}settb=AVTB,setpts=N/(30*TB)[r];"
              f"[d][r]libvmaf={opts}")
+    # The subprocess runs with cwd=temp dir (see below), so the input paths
+    # MUST be absolute — a caller's relative path (e.g. the CLI invoked with a
+    # relative -o) would otherwise resolve against the temp dir and fail with
+    # "No such file or directory" (a real bug the 10.3 CLI run surfaced).
     cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error",
-           "-i", str(distorted)]
+           "-i", os.path.abspath(distorted)]
     if ref_start:
         cmd += ["-ss", f"{ref_start:.3f}"]
     if ref_duration is not None:
         cmd += ["-t", f"{ref_duration:.3f}"]
-    cmd += ["-i", str(reference), "-lavfi", lavfi, "-f", "null", "-"]
+    cmd += ["-i", os.path.abspath(reference), "-lavfi", lavfi, "-f", "null", "-"]
     # log_path stays a bare filename + cwd=temp dir: a Windows drive-letter
     # path inside a filtergraph is an escaping tarpit (the 10.0 lesson).
     with tempfile.TemporaryDirectory(prefix="facekeep_vmaf_") as td:

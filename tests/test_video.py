@@ -574,6 +574,23 @@ def test_score_vmaf_identical_is_near_perfect(src_cfr: Path):
 
 
 @needs_vmaf
+def test_score_vmaf_accepts_relative_paths(av1_result, src_cfr: Path,
+                                           monkeypatch):
+    """Relative input paths must survive the cwd=temp-dir scoring subprocess.
+
+    The libvmaf run executes with its cwd set to a temp dir (so log_path can
+    stay a bare filename — the Windows filtergraph-escaping lesson), which
+    silently broke any *relative* distorted/reference path: it resolved
+    against the temp dir and ffmpeg failed with "No such file or directory".
+    Every earlier test/verification happened to pass absolute (tmp_path)
+    paths; the first relative-path CLI run hit it in production. Pin the fix.
+    """
+    monkeypatch.chdir(src_cfr.parent)
+    s = video.score_vmaf(Path(av1_result.output_path.name), Path(src_cfr.name))
+    assert s.mean > 50.0  # scored at all = the regression is fixed
+
+
+@needs_vmaf
 def test_score_vmaf_vfr_pairs_frames_by_order(vfr_result, src_vfr: Path):
     """The order-pairing regression: timestamp pairing on a VFR reference
     collapses to a flat false ~20 (spike-measured on a real Android clip);
