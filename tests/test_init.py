@@ -53,6 +53,9 @@ def test_written_config_is_valid_and_equals_defaults(tmp_path):
     assert cfg.aggressive.face_codec == d.aggressive.face_codec
     assert cfg.aggressive.content_aware == d.aggressive.content_aware
     assert cfg.aggressive.protect_hands == d.aggressive.protect_hands
+    assert cfg.video.enabled == d.video.enabled
+    assert cfg.video.crf == d.video.crf
+    assert cfg.video.vmaf_target == d.video.vmaf_target
 
 
 def test_written_config_is_commented(tmp_path):
@@ -85,12 +88,14 @@ def test_init_force_overwrites(tmp_path):
 def test_template_yaml_keys_are_known_fields():
     """Every key in the template is a real config field (no typos / dead keys)."""
     data = yaml.safe_load(default_config_yaml())
-    assert set(data) <= {"mode", "strip_gps", "detector", "faithful", "aggressive"}
+    assert set(data) <= {"mode", "strip_gps", "detector", "faithful",
+                         "aggressive", "video"}
     cfg = FaceKeepConfig()
     for section, obj in (
         ("detector", cfg.detector),
         ("faithful", cfg.faithful),
         ("aggressive", cfg.aggressive),
+        ("video", cfg.video),
     ):
         for key in data.get(section, {}):
             assert hasattr(obj, key), f"unknown {section}.{key} in init template"

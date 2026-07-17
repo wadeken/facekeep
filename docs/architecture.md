@@ -571,11 +571,63 @@ mode's defining trade-off. The full on-disk spec (archive layout, the complete
 `manifest.json` schema, and how to recover pixels by hand with just `unzip`) is
 documented in [fkeep-format.md](fkeep-format.md).
 
+## Faithful video (Phase 10)
+
+Videos dominate a camera roll's storage, and a phone records them with a
+*real-time hardware* encoder that buys quality with bitrate (measured 25-31
+Mbps for 4K30 HEVC on real phones). The faithful idea transfers directly: a
+slow offline **SVT-AV1** CRF re-encode spends the time the phone couldn't and
+lands 2-14x smaller at visually-lossless quality (measured on the users' own
+clips) — real pixels, the codec's own psychovisual bit allocation, and a
+standard `.mp4` output that plays anywhere modern. Opening the file *is* the
+restore. **Aggressive mode deliberately does not port to video**: per-frame AI
+super-resolution is computationally absurd on consumer hardware, flickers
+temporally, and per-frame face crops are no compression at all — a single-video
+input with `-m aggressive` errors loudly, and a folder run skips videos with
+the reason.
+
+`video.compress_video` is the pipeline (`facekeep/video.py`): probe (ffprobe
+JSON) → **skip-if-efficient** (an AV1 source unconditionally, or a low
+bits/pixel/frame — re-encoding an efficient file burns hours to add a lossy
+generation, and it keeps FaceKeep's own outputs from being re-eaten) → SVT-AV1
+encode with `-fps_mode passthrough` (phones record **VFR**; a CFR re-time
+accumulates A/V desync — the measured shipped-bug-grade gotcha), 10-bit + HLG
+VUI passthrough (HDR stays HDR; a Dolby Vision RPU degrades to its HLG base
+layer), first video + first audio track copied bit-exact, container metadata
+(creation time, GPS) mapped through → **VMAF quality gate** (default on): the
+encode is scored against the source with order-paired frames (`vmaf_4k` at
+native resolution for 4K-class sources; the pooled **p1** — the worst-1%-frame
+score — is the target, because the mean saturates) and re-encoded a CRF step
+lower on a miss; an opt-in sampled auto-tune (`video.auto_tune`) instead
+searches the highest CRF meeting the target per clip → **skip-if-larger**.
+`ffmpeg`/`ffprobe` are opt-in machine-local binaries (`$FACEKEEP_FFMPEG` →
+PATH → `None`, the avifenc pattern, never a Python dependency): without them a
+single-video input errors with an install hint and a folder run skips videos —
+photos are never affected.
+
+The CLI/batch layer (10.3) makes videos first-class in `facekeep compress`:
+video extensions gather alongside photos in folder runs (`--no-videos` /
+`video.enabled: false` excludes them — encoding is ~0.25x realtime for 4K, an
+overnight-batch feature), the `video:` config section carries the knobs, and
+`--report` rows record `codec=av1`, the CRF as `quality`, and the gate's score
+in a `vmaf_p1` column (filled only when really measured). Videos cache in the
+incremental index under their **own** settings fingerprint, so retuning a
+photo knob never re-encodes a folder's videos (and vice versa); a skipped
+video keeps the original (copied into a differing output dir, like faithful's
+skip-if-larger) and the verdict is recorded so re-runs skip it too. Encoding
+is **strictly serial** — videos never enter the `--jobs` pool, because SVT-AV1
+already saturates every core; each encode is announced on stderr with the
+clip's resolution/length and an ETA computed from the throughput measured on
+the videos already completed in the same run (the first says "measuring"
+rather than guessing). A dry run probes and reports the decision but never
+test-encodes a video, so `--dry-run` stays cheap and honest (no invented size
+estimate).
+
 ## Components
 
 - **config.py** — `FaceKeepConfig` (dataclasses) with `validate()`, YAML
   `load()`/`save()`. Sub-configs: `DetectorConfig`, `FaithfulConfig`,
-  `AggressiveConfig`. Also home to the **aggressive-mode presets** (`PRESETS`,
+  `AggressiveConfig`, `VideoConfig`. Also home to the **aggressive-mode presets** (`PRESETS`,
   `apply_preset`, `preset_restore_overrides`): named knob bundles applied as a
   precedence layer (defaults < preset < explicit YAML < explicit CLI), with
   `load()` recording the YAML-explicit keys so the layer order holds wherever
@@ -685,9 +737,19 @@ documented in [fkeep-format.md](fkeep-format.md).
   (the CLI), so it never contends with `--jobs` workers. (The per-image detection
   cache that complements it lives in `detector.py` — see above; both are
   parent-process-only and share the detector-field set that busts them.)
+- **video.py** — the faithful video pipeline (see "Faithful video" above):
+  `probe_video`/`compress_video`/`score_vmaf`/`find_crf`, the
+  `VIDEO_EXTENSIONS` set the CLI gathers by, and the `$FACEKEEP_FFMPEG` → PATH
+  binary gating (`find_ffmpeg`/`ffmpeg_available`/`vmaf_available`). Photos
+  never import it at pipeline time; `config.py` imports only its default
+  constants so the `video:` section can't drift from the library defaults.
 - **aggressive/** — `compressor`, `blender`, `format`, `restorer`.
 - **cli.py** — Click CLI: `compress`, `restore`, `info`, `quality`, `compare`,
-  `verify`, `bench`, `init`, `gui`.
+  `verify`, `bench`, `init`, `gui`. `compress` routes each gathered file by
+  kind: photos through `_process_one` (serial or the `--jobs` pool), videos
+  through `_process_one_video` (always serial in the parent, with the stderr
+  ETA line); the two share the replay/summary/report machinery so a mixed
+  folder prints one coherent ledger.
 - **compare.py** — `facekeep compare`: a read-only before/after viewer. Loads an
   original and a compressed artifact, reconstructs the "after" (faithful decode /
   `.fkeep` restore or `--preview` bicubic / a standard image), and writes a single

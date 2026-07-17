@@ -15,8 +15,11 @@ verification layer (10.2): every written encode is scored with libvmaf by
 default (order-paired frames, ``vmaf_4k`` at native resolution for 4K-class
 sources) and re-encoded a CRF step lower on a miss, and an opt-in sampled CRF
 auto-tune (``auto_tune=True``) searches the highest CRF that still meets the
-target. CLI/batch integration (10.3) builds on it; nothing here is wired into
-``facekeep compress`` yet.
+target. ``facekeep compress`` wires it in (10.3, ``cli.py``): videos are
+gathered alongside photos, configured by the ``video:`` config section, cached
+in the incremental index under their own fingerprint, and always encoded
+serially in the parent process (SVT-AV1 saturates the cores — ``--jobs``
+applies to photos only).
 
 ``ffmpeg``/``ffprobe`` are **opt-in, machine-local external binaries** — the
 avifenc pattern: ``$FACEKEEP_FFMPEG`` -> PATH -> ``None``, never a Python
@@ -381,7 +384,20 @@ def default_output_path(input_path: Union[str, Path]) -> Path:
     stem suffix instead of overwriting the source.
     """
     src = Path(input_path)
-    out = _with_video_extension(src, ".mp4")
+    return output_path_for(src, src.parent)
+
+
+def output_path_for(input_path: Union[str, Path], out_dir: Union[str, Path]) -> Path:
+    """The ``.mp4`` output path for a video landing in ``out_dir``.
+
+    The folder-run form of :func:`default_output_path` (which is this with
+    ``out_dir = src.parent``): the name keeps dotted filenames intact (only a
+    *known* video extension is swapped for ``.mp4``), and an output that would
+    collide with the source itself (an in-place ``.mp4`` input) gets an
+    ``_av1`` stem suffix instead of overwriting it.
+    """
+    src = Path(input_path)
+    out = Path(out_dir) / _with_video_extension(Path(src.name), ".mp4").name
     if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(src)):
         out = out.with_name(out.stem + "_av1.mp4")
     return out

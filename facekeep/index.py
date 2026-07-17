@@ -185,6 +185,31 @@ def settings_fingerprint(config: FaceKeepConfig) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
+def video_settings_fingerprint(config: FaceKeepConfig) -> str:
+    """Fingerprint of the video knobs — videos cache independently of photos.
+
+    A video's output bytes depend only on the ``video:`` section, never on the
+    photo mode/codec/detector settings (and vice versa), so videos get their own
+    fingerprint: retuning the photo quality must not re-encode every video in
+    the folder (a video re-encode costs minutes-to-hours, the exact work the
+    index exists to skip). Every field here is output-affecting: ``crf``/
+    ``preset`` set the encode, ``vmaf_target`` can lower the CRF via the gate,
+    ``auto_tune`` replaces the fixed CRF per clip, and ``skip_efficient``
+    decides whether an output exists at all. (``enabled`` is not hashed — it
+    only selects which files are gathered, like a CLI path argument.)
+    """
+    relevant = {
+        "mode": "video",
+        "crf": config.video.crf,
+        "preset": config.video.preset,
+        "vmaf_target": config.video.vmaf_target,
+        "auto_tune": config.video.auto_tune,
+        "skip_efficient": config.video.skip_efficient,
+    }
+    blob = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
 @dataclass
 class IndexRow:
     """One cached file outcome (the fields a lookup needs + diagnostics)."""

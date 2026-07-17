@@ -37,6 +37,7 @@ FIELDNAMES = [
     "ssim_downscaled",
     "status",
     "output_path",
+    "vmaf_p1",
 ]
 
 
@@ -47,6 +48,10 @@ class ReportRow:
     ``None`` is deliberate, not lazy: ``ssim_downscaled`` is None unless a real
     score was measured, ``quality`` is None for aggressive mode (its bg_scale is
     not a 0-100 codec quality), and sizes/ratio are None for a failed file.
+    ``vmaf_p1`` is the video counterpart of the honesty rule: the per-frame
+    1%-low VMAF of the written encode, filled only when the quality gate really
+    scored it (blank when the gate is off, libvmaf is absent, or the row is not
+    a video). For a video row, ``quality`` carries the SVT-AV1 CRF used.
     """
 
     file: str
@@ -60,6 +65,7 @@ class ReportRow:
     faces: Optional[int] = None
     ssim_downscaled: Optional[float] = None
     output_path: Optional[str] = None
+    vmaf_p1: Optional[float] = None
 
     def as_csv_dict(self) -> dict:
         """Render to the CSV column dict; None -> "" (blank cell), floats rounded."""
@@ -77,6 +83,7 @@ class ReportRow:
             ),
             "status": self.status,
             "output_path": _s(self.output_path),
+            "vmaf_p1": "" if self.vmaf_p1 is None else f"{self.vmaf_p1:.2f}",
         }
 
 

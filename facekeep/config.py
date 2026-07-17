@@ -7,6 +7,11 @@ from typing import Optional
 import yaml
 
 from .exceptions import ConfigError
+# Single source of truth for the video defaults (video.py documents the
+# measured rationale); the dataclass below mirrors them so the YAML/CLI layer
+# and the library API can never drift apart. video.py imports only stdlib +
+# exceptions, so this adds no import cycle and no heavy dependency.
+from .video import DEFAULT_CRF, DEFAULT_PRESET, DEFAULT_VMAF_TARGET
 
 
 @dataclass
@@ -429,6 +434,51 @@ class AggressiveConfig:
         )
 
 
+@dataclass
+class VideoConfig:
+    """Faithful video re-encode settings (ROADMAP Phase 10).
+
+    Videos in a compress run (a video file, or videos found in a folder) are
+    faithfully re-encoded with SVT-AV1 into a standard ``.mp4`` — the same
+    bargain as faithful photos: real pixels, the codec's own psychovisual bit
+    allocation, opening the file *is* the restore. Aggressive mode deliberately
+    does NOT apply to video (per-frame AI SR is computationally absurd and
+    temporally unstable). Needs the external ``ffmpeg`` binary
+    (``$FACEKEEP_FFMPEG`` -> PATH — the avifenc pattern, never a Python
+    dependency); without it videos are skipped with an install hint and photos
+    are unaffected. Videos always encode serially (SVT-AV1 already saturates
+    the cores, so ``--jobs`` fan-out would only slow everything down).
+    """
+
+    # Include videos in compress runs. Off = photos only (the pre-Phase-10
+    # behavior). The escape hatch exists because video encoding is *slow*
+    # (~0.25x realtime for 4K on a desktop CPU — an overnight-batch feature),
+    # so a quick photo pass must be one flag away: CLI `--no-videos`.
+    enabled: bool = True
+    # SVT-AV1 CRF (0-63, lower = better quality / larger). The default is the
+    # conservative end of the measured visually-lossless band on real phone
+    # clips; the VMAF gate below catches content it was never measured on.
+    crf: int = DEFAULT_CRF
+    # SVT-AV1 speed preset (0-13, lower = slower/smaller). The default is the
+    # measured speed/quality point (~0.25x realtime for 4K).
+    preset: int = DEFAULT_PRESET
+    # Post-encode VMAF quality gate: score the encode against the source and
+    # re-encode at a lower CRF when the per-frame 1%-low (p1) misses this
+    # target ("the worst moments still look good"). None disables the gate —
+    # scoring costs about as much as the encode itself on 4K. Needs libvmaf in
+    # the ffmpeg build; a build without it skips the gate with a warning.
+    vmaf_target: Optional[float] = DEFAULT_VMAF_TARGET
+    # Opt-in sampled CRF auto-tune: probe a few short spans to find the highest
+    # CRF that still meets vmaf_target, instead of the fixed `crf`. Costs ~6
+    # short probe encodes per file before the real encode (the reason it is
+    # opt-in); the gate then verifies the full file.
+    auto_tune: bool = False
+    # Skip sources that are already efficiently encoded (AV1, or a low
+    # bits/pixel/frame) instead of burning hours adding a lossy generation for
+    # nothing. Also what keeps our own outputs from being re-eaten on a re-run.
+    skip_efficient: bool = True
+
+
 # ---------------------------------------------------------------------------
 # Aggressive-mode presets: one-word intent -> a tuned knob bundle.
 #
@@ -605,7 +655,7 @@ def default_config_yaml() -> str:
     dataclass default, so omitting a line is the same as the default.
     """
     c = FaceKeepConfig()  # source the defaults so a drift is at least visible here
-    f, a, d = c.faithful, c.aggressive, c.detector
+    f, a, d, v = c.faithful, c.aggressive, c.detector, c.video
     return f"""\
 # FaceKeep configuration. Every key is optional; an omitted key uses its
 # default (shown here). Delete what you don't need. See docs/architecture.md.
@@ -701,6 +751,25 @@ aggressive:
   # Blend restored faces with the un-enhanced pixels (1.0 = full enhancement;
   # ~0.6-0.8 softens the "too-perfect face" look). Both backends.
   face_enhance_strength: {a.face_enhance_strength}
+
+# Faithful video re-encode (videos in a folder run, or a video file given
+# directly). SVT-AV1 into a standard .mp4 - real pixels, plays anywhere modern,
+# no restore step; HDR (10-bit/HLG) and VFR timestamps survive. Needs the
+# external ffmpeg binary (FACEKEEP_FFMPEG or PATH; a build with libsvtav1);
+# without it videos are skipped with a hint and photos are unaffected.
+# Videos always encode serially (--jobs applies to photos only).
+video:
+  enabled: {str(v.enabled).lower()}      # include videos in compress runs (CLI --no-videos skips once)
+  crf: {v.crf}             # SVT-AV1 CRF 0-63 (lower = better quality, larger file)
+  preset: {v.preset}            # SVT-AV1 speed preset 0-13 (lower = slower, smaller)
+  # Post-encode VMAF quality gate: re-encode at a lower CRF when the worst-1%
+  # frame score (p1) misses this target. Scoring costs about as much as the
+  # encode itself on 4K; set to null to skip verification. Needs libvmaf in
+  # the ffmpeg build (skipped with a warning otherwise).
+  vmaf_target: {v.vmaf_target}
+  # Opt-in: probe short samples to find the highest CRF meeting vmaf_target
+  # per clip (instead of the fixed crf above). Slower at compress time.
+  auto_tune: {str(v.auto_tune).lower()}
 """
 
 
@@ -718,6 +787,7 @@ class FaceKeepConfig:
     detector: DetectorConfig = field(default_factory=DetectorConfig)
     faithful: FaithfulConfig = field(default_factory=FaithfulConfig)
     aggressive: AggressiveConfig = field(default_factory=AggressiveConfig)
+    video: VideoConfig = field(default_factory=VideoConfig)
 
     def validate(self) -> None:
         """Validate configuration values, raising ConfigError on problems."""
@@ -872,6 +942,17 @@ class FaceKeepConfig:
             raise ConfigError(
                 "aggressive.face_enhance_strength must be between 0 and 1"
             )
+        if not 0 <= self.video.crf <= 63:
+            raise ConfigError("video.crf must be 0-63 (SVT-AV1 CRF range)")
+        if not 0 <= self.video.preset <= 13:
+            raise ConfigError("video.preset must be 0-13 (SVT-AV1 preset range)")
+        if self.video.vmaf_target is not None and not (
+            0 < self.video.vmaf_target <= 100
+        ):
+            raise ConfigError(
+                "video.vmaf_target must be between 0 (exclusive) and 100 "
+                "(or null to disable the quality gate)"
+            )
         if self.aggressive.preset is not None:
             if self.aggressive.preset not in PRESETS:
                 raise ConfigError(
@@ -916,7 +997,7 @@ class FaceKeepConfig:
         for top in ("mode", "strip_gps"):
             if top in data:
                 explicit.add(top)
-        for section in ("detector", "faithful", "aggressive"):
+        for section in ("detector", "faithful", "aggressive", "video"):
             if isinstance(data.get(section), dict):
                 for key in data[section]:
                     explicit.add(f"{section}.{key}")
@@ -940,6 +1021,7 @@ class FaceKeepConfig:
             ("detector", config.detector),
             ("faithful", config.faithful),
             ("aggressive", config.aggressive),
+            ("video", config.video),
         ):
             if section in data and isinstance(data[section], dict):
                 for key, value in data[section].items():
@@ -958,6 +1040,7 @@ class FaceKeepConfig:
             "detector": vars(self.detector),
             "faithful": vars(self.faithful),
             "aggressive": vars(self.aggressive),
+            "video": vars(self.video),
         }
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:

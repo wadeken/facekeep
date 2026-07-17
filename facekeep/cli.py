@@ -12,6 +12,7 @@ import importlib.util
 import logging
 import multiprocessing
 import os
+import shutil
 import sqlite3
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -19,7 +20,7 @@ from pathlib import Path
 
 import click
 
-from . import __version__, index as index_mod, report
+from . import __version__, index as index_mod, report, video as video_mod
 from .config import (
     PRESET_NAMES,
     FaceKeepConfig,
@@ -92,6 +93,23 @@ def _fmt_size(n: float) -> str:
             return f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} TB"
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Clock-style duration (``M:SS`` / ``H:MM:SS``) for clip lengths/elapsed."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
+
+
+def _fmt_eta(seconds: float) -> str:
+    """Humanized rough ETA — an estimate deserves coarse units, not ``M:SS``."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
 
 
 def _load_config(config_path, mode, codec, quality, bg_scale,
@@ -330,6 +348,111 @@ def _process_one(file_str: str, target: str, config: FaceKeepConfig,
     return result
 
 
+def _keep_original_video(src: Path, target: Path) -> Path:
+    """Keep-the-original semantics for a skipped video (the CLI's job per 10.1).
+
+    Mirrors faithful mode's ``encoders.copy_original``: when the run writes to
+    a *different* directory (a backup destination), the original is copied
+    there so the destination is complete; an in-place run leaves the source
+    untouched. The copy keeps the source's real name/extension (it is the
+    original, not an AV1 ``.mp4``). Never copies a file onto itself.
+    """
+    dest = target.parent / src.name
+    if dest.exists():
+        try:
+            if os.path.samefile(src, dest):
+                return src
+        except OSError:
+            pass
+    elif os.path.normcase(os.path.abspath(src)) == os.path.normcase(
+        os.path.abspath(dest)
+    ):
+        return src
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dest)
+    return dest
+
+
+def _process_one_video(file_str: str, target: str, video_config,
+                       dry_run: bool) -> dict:
+    """Compress a single video and return a result dict (parent-process only).
+
+    The video sibling of :func:`_process_one`. It always runs serially in the
+    parent — videos are never submitted to the ``--jobs`` pool, because SVT-AV1
+    already saturates every core on its own (fanning encodes out would
+    oversubscribe the CPU and slow all of them; ROADMAP 10.3's serial-encode
+    discipline).
+
+    Dry-run honesty: a photo dry-run performs the real encode and discards it,
+    but a video encode costs minutes-to-hours — running it under ``--dry-run``
+    would defeat the flag. So a video dry-run only probes and reports the
+    *decision* (would-encode vs keep-original), with **no size estimate**
+    (status ``would-encode``, blank output size) rather than an invented one.
+
+    Result statuses: ``ok`` (encoded, written), ``kept-original`` (skipped as
+    already-efficient or not-smaller; the original is copied to a differing
+    output dir — see :func:`_keep_original_video`), ``would-encode`` (dry-run
+    only), plus the shared ``skipped``/``failed`` shapes. ``quality`` carries
+    the SVT-AV1 CRF used and ``vmaf_p1`` the gate's 1%-low score when it ran.
+    ``output_path`` is the absolute artifact path (output or kept original),
+    which the index records verbatim.
+    """
+    f = Path(file_str)
+    result: dict = {"file": f.name, "mode": "video"}
+    try:
+        if dry_run:
+            info = video_mod.probe_video(f)
+            reason = (video_mod._efficiency_skip_reason(info)
+                      if video_config.skip_efficient else None)
+            size = info.size_bytes or f.stat().st_size
+            if reason is not None:
+                result.update(
+                    status="kept-original", reason=reason,
+                    original_size=size, compressed_size=size, ratio=1.0,
+                    quality=None, output_name=f.name, output_path=str(f),
+                )
+            else:
+                result.update(
+                    status="would-encode", original_size=size,
+                    quality=video_config.crf, output_name=Path(target).name,
+                )
+        else:
+            res = video_mod.compress_video(
+                f, target,
+                crf=video_config.crf, preset=video_config.preset,
+                skip_efficient=video_config.skip_efficient,
+                vmaf_target=video_config.vmaf_target,
+                auto_tune=video_config.auto_tune,
+            )
+            if res.skipped:
+                kept = _keep_original_video(f, Path(target))
+                result.update(
+                    status="kept-original", reason=res.skip_reason,
+                    original_size=res.original_size,
+                    compressed_size=res.original_size, ratio=1.0,
+                    quality=res.crf_used, output_name=kept.name,
+                    output_path=str(kept), encode_seconds=res.encode_seconds,
+                )
+            else:
+                result.update(
+                    status="ok", codec="av1",
+                    original_size=res.original_size,
+                    compressed_size=res.compressed_size, ratio=res.ratio,
+                    quality=res.crf_used,
+                    vmaf_p1=res.vmaf.p1 if res.vmaf is not None else None,
+                    output_name=res.output_path.name,
+                    output_path=str(res.output_path),
+                    encode_seconds=res.encode_seconds,
+                )
+    except SkipFileError as e:
+        result.update(status="skipped", error=str(e))
+    except FaceKeepError as e:
+        result.update(status="failed", error=str(e))
+    except Exception as e:  # noqa: BLE001 - isolate unexpected per-file failures
+        result.update(status="failed-unexpected", error=str(e))
+    return result
+
+
 def _print_result(res: dict, tag: str, dry_run: bool) -> None:
     """Render one worker result to the terminal (parent side, in input order)."""
     click.echo(f"[{tag}] {res['file']} ... ", nl=False)
@@ -343,6 +466,27 @@ def _print_result(res: dict, tag: str, dry_run: bool) -> None:
         click.echo(f"FAILED: {res['error']}", err=True)
     elif status == "failed-unexpected":
         click.echo(f"FAILED (unexpected): {res['error']}", err=True)
+    elif res["mode"] == "video":
+        if status == "would-encode":
+            # Dry-run honesty: no encode ran, so no size estimate is printed —
+            # a video is too expensive to test-encode under --dry-run.
+            click.echo(
+                f"WOULD ENCODE (av1 crf {res['quality']}; size unknown - "
+                f"videos are not test-encoded in a dry run) -> {res['output_name']}"
+            )
+        elif status == "kept-original":
+            verb = "WOULD KEEP ORIGINAL" if dry_run else "KEPT ORIGINAL"
+            click.echo(f"{verb} ({res['reason']}) -> {res['output_name']}")
+        else:  # encoded + written
+            vmaf = res.get("vmaf_p1")
+            vmaf_note = "" if vmaf is None else f", VMAF p1={vmaf:.1f}"
+            click.echo(
+                f"OK  {_fmt_size(res['original_size'])} -> "
+                f"{_fmt_size(res['compressed_size'])} ({res['ratio']:.1f}x, "
+                f"av1 crf{res['quality']}{vmaf_note}, "
+                f"in {_fmt_duration(res.get('encode_seconds') or 0)}) "
+                f"-> {res['output_name']}"
+            )
     elif res["mode"] == "faithful":
         if status == "skipped-larger":
             verb = "WOULD KEEP ORIGINAL" if dry_run else "KEPT ORIGINAL"
@@ -383,6 +527,27 @@ def _row_from_result(res: dict, dry_run: bool) -> report.ReportRow:
             codec=res.get("codec"), original_bytes=res.get("original_size"),
             output_bytes=res.get("compressed_size"), ratio=res.get("ratio"),
             quality=res.get("quality"), output_path=res.get("output_name"),
+        )
+    if res["mode"] == "video":
+        if status == "would-encode":
+            # Dry-run: the decision is recorded, sizes stay blank (no encode
+            # ran, and the report never invents a number).
+            return report.ReportRow(
+                file=res["file"], mode="video", status="would-write",
+                codec="av1", quality=res.get("quality"),
+                original_bytes=res.get("original_size"),
+                output_path=res.get("output_name"),
+            )
+        if status == "kept-original":
+            row_status = "would-keep-original" if dry_run else "kept-original"
+        else:
+            row_status = "written"
+        return report.ReportRow(
+            file=res["file"], mode="video", status=row_status,
+            codec=res.get("codec"), quality=res.get("quality"),
+            original_bytes=res.get("original_size"),
+            output_bytes=res.get("compressed_size"), ratio=res.get("ratio"),
+            vmaf_p1=res.get("vmaf_p1"), output_path=res.get("output_name"),
         )
     if res["mode"] == "faithful":
         if status == "skipped-larger":
@@ -488,14 +653,24 @@ def cli():
                    "round-trip (implies --verify).")
 @click.option("--dry-run", is_flag=True,
               help="Estimate projected sizes/ratios without writing any output "
-                   "(runs the real encode/pack, then discards it).")
+                   "(runs the real encode/pack for photos, then discards it; "
+                   "videos are probed only — encoding one costs minutes-to-"
+                   "hours, so no size is estimated).")
 @click.option("--report", "report_path", type=click.Path(), default=None,
               help="Write a per-file CSV report (size, ratio, quality, faces, "
                    "codec). The SSIM column is filled only when actually measured "
                    "— pair with --verify-thorough for faithful mode.")
 @click.option("-j", "--jobs", type=int, default=1,
               help="Process a folder across N worker processes (default: 1 = "
-                   "serial). 0 = one per CPU. Ignored for a single file.")
+                   "serial). 0 = one per CPU. Ignored for a single file. "
+                   "Photos only: videos always encode serially (SVT-AV1 "
+                   "already saturates the cores).")
+@click.option("--no-videos", is_flag=True,
+              help="Exclude videos from this run (photos only). Videos are "
+                   "otherwise compressed faithfully to AV1 .mp4 — slow "
+                   "(roughly 4 minutes per minute of 4K on a desktop CPU), so "
+                   "this is the quick-photo-pass escape hatch. Config: "
+                   "video.enabled.")
 @click.option("--no-progress", is_flag=True,
               help="Disable the folder progress bar (shown by default on a "
                    "terminal for multi-file runs; auto-hidden when piped).")
@@ -516,14 +691,23 @@ def cli():
 def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
              bit_depth, bg_scale, quality_target, lossless, residual, strip_gps,
              config_path, verify, verify_thorough, dry_run, report_path, jobs,
-             no_progress, force, index_path, no_index, no_detect_cache, verbose):
-    """Compress photo(s). INPUT_PATH is an image file or a directory.
+             no_videos, no_progress, force, index_path, no_index,
+             no_detect_cache, verbose):
+    """Compress photo(s) and video(s). INPUT_PATH is a file or a directory.
 
     Faithful mode (the default) writes a standard .avif/.jxl with every pixel
     real - no restore step. For a dramatic, library-wide shrink switch to
     aggressive mode (-m aggressive, or just pick a --preset, which implies it):
     faces/hands/detail are kept sharp, the benign background is rebuilt on
     restore, and the output is a .fkeep you bring back with `facekeep restore`.
+
+    Videos (mp4/mov/...) are compressed faithfully too: a slow offline SVT-AV1
+    re-encode into a standard .mp4 that plays anywhere modern (typically 2-10x
+    smaller than a phone recording at visually-lossless quality, VMAF-verified;
+    HDR and A/V sync survive). It needs the external ffmpeg binary - without
+    one, videos are skipped with a hint. Encoding is slow (an overnight-batch
+    feature); --no-videos excludes them for a quick photo pass. Aggressive
+    mode never applies to video.
 
     HEIC/HEIF input (e.g. iPhone photos) needs the optional [heic] extra
     (pip install "facekeep[heic]"); without it those files are skipped with a hint.
@@ -537,12 +721,54 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
         click.echo(f"Config error: {e}", err=True)
         sys.exit(2)
 
-    files = _gather(Path(input_path), IMAGE_EXTS)
-    if not files:
-        click.echo(f"No supported images found in: {input_path}", err=True)
+    in_p = Path(input_path)
+    include_videos = config.video.enabled and not no_videos
+    photo_files = _gather(in_p, IMAGE_EXTS)
+    video_files = _gather(in_p, video_mod.VIDEO_EXTENSIONS) if include_videos else []
+    if not photo_files and not video_files:
+        if not include_videos and _gather(in_p, video_mod.VIDEO_EXTENSIONS):
+            click.echo(
+                f"Only video files found in: {input_path} - but videos are "
+                "excluded (--no-videos / video.enabled: false).",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"No supported images or videos found in: {input_path}", err=True
+            )
         sys.exit(1)
 
-    in_p = Path(input_path)
+    # A video is *never* processed by aggressive mode (ROADMAP Phase 10:
+    # per-frame AI restore is computationally absurd and temporally unstable —
+    # video is faithful-only, honestly). An explicit single-video input in
+    # aggressive mode is a loud error; in a folder run the photos proceed
+    # aggressively and each video is skipped with the reason.
+    video_skip_reason = None
+    if video_files and config.mode == "aggressive":
+        if in_p.is_file():
+            click.echo(
+                "Aggressive mode does not apply to video (video is "
+                "faithful-only). Re-run without -m aggressive/--preset to "
+                "compress this video.",
+                err=True,
+            )
+            sys.exit(2)
+        video_skip_reason = (
+            "aggressive mode does not apply to video - re-run without "
+            "-m aggressive/--preset to compress videos (faithful)"
+        )
+    # Videos need the external ffmpeg binary (the avifenc pattern). Missing:
+    # a single-video input errors with the install hint; a folder run skips
+    # each video with the hint and processes the photos (the HEIC precedent).
+    elif video_files and not video_mod.ffmpeg_available():
+        if not photo_files and in_p.is_file():
+            click.echo(video_mod._MISSING_FFMPEG_HINT, err=True)
+            sys.exit(2)
+        video_skip_reason = video_mod._MISSING_FFMPEG_HINT
+
+    video_set = set(video_files)
+    files = sorted(set(photo_files) | video_set)
+
     out_p = Path(output_path) if output_path else (in_p if in_p.is_dir() else in_p.parent)
     if output_path and len(files) > 1 and not dry_run:
         out_p.mkdir(parents=True, exist_ok=True)
@@ -550,11 +776,31 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     tag = "dry-run" if dry_run else config.mode
 
     # Resolve each file's output target up front (same logic as before): an
-    # explicit single-file -o path wins, else "<dir>/<stem>".
+    # explicit single-file -o path wins, else "<dir>/<stem>" for photos (the
+    # writers append the codec/.fkeep extension) and the collision-safe
+    # "<dir>/<stem>.mp4" for videos.
     single_explicit_file = (
         output_path is not None and len(files) == 1 and not Path(output_path).is_dir()
     )
-    targets = {f: _resolve_target(f, out_p, single_explicit_file) for f in files}
+    targets = {
+        f: (
+            str(out_p) if single_explicit_file
+            else str(video_mod.output_path_for(f, out_p))
+        ) if f in video_set
+        else _resolve_target(f, out_p, single_explicit_file)
+        for f in files
+    }
+
+    # Videos precluded from this run (aggressive mode / no ffmpeg) become
+    # ready-made skip results: they take part in the replay/report like any
+    # other outcome but are never probed, looked up in the index, or encoded.
+    video_precluded: dict = {}
+    if video_skip_reason is not None:
+        for f in video_files:
+            video_precluded[f] = {
+                "file": f.name, "mode": "video", "status": "skipped",
+                "error": video_skip_reason,
+            }
 
     # Incremental index: decide which files we can skip because they are
     # byte-identical to the last successful run, with the same output-affecting
@@ -579,23 +825,34 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
             Path(index_path) if index_path else index_dir / index_mod.INDEX_FILENAME
         )
     fingerprint = index_mod.settings_fingerprint(config)
+    # Videos cache under their own fingerprint (only the video: knobs): retuning
+    # a photo setting must not bust a folder's cached video encodes — a video
+    # re-encode costs minutes-to-hours, exactly the work the index exists to skip.
+    video_fingerprint = (
+        index_mod.video_settings_fingerprint(config) if video_files else None
+    )
+
+    def _fingerprint_for(f: Path) -> str:
+        return video_fingerprint if f in video_set else fingerprint
+
     # SHA-256 of each input, computed once and reused for both the skip lookup
     # and the post-run record (so we never hash a file twice).
     hashes: dict = {}
     skipped_unchanged: dict = {}  # f -> result dict for a cache hit
-    to_process = list(files)
+    candidates = [f for f in files if f not in video_precluded]
+    to_process = list(candidates)
     if use_index and not force:
         try:
             with index_mod.ProcessIndex(db_path) as idx:
                 remaining = []
-                for f in files:
+                for f in candidates:
                     try:
                         h = index_mod.hash_file(f)
                     except OSError:
                         remaining.append(f)  # unreadable now: let the pipeline report it
                         continue
                     hashes[f] = h
-                    hit = idx.is_unchanged(f, h, fingerprint)
+                    hit = idx.is_unchanged(f, h, _fingerprint_for(f))
                     if hit is not None:
                         skipped_unchanged[f] = {
                             "file": f.name, "mode": hit.mode,
@@ -614,28 +871,37 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
             logging.getLogger("facekeep.cli").warning(
                 "Ignoring unreadable index (%s); processing all files.", e
             )
-            to_process = list(files)
+            to_process = list(candidates)
             skipped_unchanged = {}
 
+    # Split the work: photos may fan out to the --jobs pool; videos NEVER do —
+    # SVT-AV1 already saturates every core on one encode, so parallel video
+    # encodes would oversubscribe the CPU and slow all of them (ROADMAP 10.3's
+    # serial-encode discipline). Videos run serially in the parent, after the
+    # photos.
+    to_process_photos = [f for f in to_process if f not in video_set]
+    to_process_videos = [f for f in to_process if f in video_set]
+
     # How many workers? 1 (default) = serial, the original code path with no
-    # pool overhead. 0 = one per CPU. Otherwise clamp to [1, files, cpu]: never
+    # pool overhead. 0 = one per CPU. Otherwise clamp to [1, photos, cpu]: never
     # spawn more workers than files, and a single file is always serial (the
-    # pool/pickle cost would only slow it down). Workers run only on the files we
-    # actually need to process (cache skips are excluded).
-    n_files = len(to_process)
+    # pool/pickle cost would only slow it down). Workers run only on the photos
+    # we actually need to process (cache skips are excluded; videos are serial).
+    n_photos = len(to_process_photos)
     cpu = os.cpu_count() or 1
     n_workers = cpu if jobs == 0 else max(1, jobs)
-    n_workers = min(n_workers, max(1, n_files), cpu)
-    parallel = n_workers > 1 and n_files > 1
+    n_workers = min(n_workers, max(1, n_photos), cpu)
+    parallel = n_workers > 1 and n_photos > 1
 
-    # Show a progress bar only for a multi-file run on an interactive terminal:
+    # Show a progress bar only for a multi-photo run on an interactive terminal:
     # a single file stays terse (the bar would be noise), and a non-TTY (CI,
     # pipe, the test runner) gets no bar so stdout/stderr stay clean. The bar is
     # purely cosmetic — see _maybe_progress — and conveys liveness while workers
     # run, which input-ordered result printing alone cannot. The total is the
-    # number of files we actually process (cache-skipped files aren't work).
+    # number of photos we actually process (cache-skipped files aren't work;
+    # videos get their own per-file liveness/ETA lines instead of the bar).
     show_progress = (
-        not no_progress and n_files > 1 and _stderr_isatty()
+        not no_progress and n_photos > 1 and _stderr_isatty()
     )
 
     # Detection cache: a user-global cache of face detections (keyed by content
@@ -684,7 +950,7 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     # identical to (and as deterministic as) a serial run regardless of
     # completion order. The progress bar advances per completed file and does not
     # touch the collected results.
-    results: dict = dict(skipped_unchanged)
+    results: dict = {**video_precluded, **skipped_unchanged}
     try:
         if parallel:
             # Force the "spawn" start method for the worker pool. The default on
@@ -704,14 +970,14 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                 futures = {
                     ex.submit(_process_one, str(f), targets[f], config, dry_run,
                               bool(report_path)): f
-                    for f in to_process
+                    for f in to_process_photos
                 }
-                for fut in _maybe_progress(as_completed(futures), n_files,
+                for fut in _maybe_progress(as_completed(futures), n_photos,
                                            show_progress):
                     f = futures[fut]
                     results[f] = fut.result()
         else:
-            for f in _maybe_progress(to_process, n_files, show_progress):
+            for f in _maybe_progress(to_process_photos, n_photos, show_progress):
                 results[f] = _process_one(str(f), targets[f], config, dry_run,
                                           bool(report_path),
                                           detection_cache=detect_cache,
@@ -720,29 +986,75 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
         if detect_cache is not None:
             detect_cache.close()
 
+    # Videos: serial, in the parent (see the split above). Each real encode is
+    # announced up front on stderr with the clip's size/length and an ETA
+    # derived from the throughput (pixels per wall-second, encode + quality
+    # gate) measured on the videos already completed *this run* — the honest
+    # per-machine number the ROADMAP asked for. The first video has nothing
+    # measured yet and says so instead of guessing.
+    done_pixels = 0.0
+    done_seconds = 0.0
+    for i, f in enumerate(to_process_videos, 1):
+        pixels = None
+        if not dry_run:
+            vinfo = None
+            try:
+                vinfo = video_mod.probe_video(f)
+            except FaceKeepError:
+                pass  # unreadable/unprobeable: the compress call reports it
+            will_encode = vinfo is not None and (
+                not config.video.skip_efficient
+                or video_mod._efficiency_skip_reason(vinfo) is None
+            )
+            if will_encode:
+                pixels = (vinfo.width * vinfo.height
+                          * vinfo.duration_s * vinfo.fps)
+                eta = (
+                    f"est ~{_fmt_eta(pixels / (done_pixels / done_seconds))}"
+                    if done_seconds and done_pixels and pixels
+                    else "measuring encode speed on this first video"
+                )
+                click.echo(
+                    f"[video {i}/{len(to_process_videos)}] {f.name}: "
+                    f"{vinfo.width}x{vinfo.height} "
+                    f"{_fmt_duration(vinfo.duration_s)} - encoding ({eta})",
+                    err=True,
+                )
+        res = _process_one_video(str(f), targets[f], config.video, dry_run)
+        results[f] = res
+        secs = res.get("encode_seconds") or 0.0
+        if res["status"] == "ok" and pixels and secs > 0:
+            done_pixels += pixels
+            done_seconds += secs
+
     # Record successful outcomes back into the index so the next run can skip
-    # them. Only ok/skipped-larger are cached (a failed file must retry next
-    # time); cache hits are already recorded. Writes happen here in the parent,
-    # in input order, after all workers have returned — the DB is never touched
-    # by a worker. --force still records (it refreshes the cache).
+    # them. Only ok/skipped-larger/kept-original are cached (a failed file must
+    # retry next time); cache hits are already recorded. Writes happen here in
+    # the parent, in input order, after all workers have returned — the DB is
+    # never touched by a worker. --force still records (it refreshes the cache).
     if use_index:
         try:
             with index_mod.ProcessIndex(db_path) as idx:
                 for f in to_process:
                     res = results[f]
-                    if res["status"] not in ("ok", "skipped-larger"):
+                    if res["status"] not in ("ok", "skipped-larger",
+                                             "kept-original"):
                         continue
                     h = hashes.get(f) or index_mod.hash_file(f)
-                    # The path that must still exist for a future skip: the writer
-                    # appended the codec/.fkeep extension to <dir>/<stem>, except
-                    # in the single explicit-file case where the target is verbatim.
-                    target_out = (
-                        Path(targets[f]) if single_explicit_file
-                        else out_p / res["output_name"]
-                    )
+                    # The path that must still exist for a future skip. Video
+                    # results carry the exact artifact path (output, or the
+                    # kept original); photo writers appended the codec/.fkeep
+                    # extension to <dir>/<stem>, except in the single
+                    # explicit-file case where the target is verbatim.
+                    if "output_path" in res:
+                        target_out = Path(res["output_path"])
+                    elif single_explicit_file:
+                        target_out = Path(targets[f])
+                    else:
+                        target_out = out_p / res["output_name"]
                     idx.record(f, index_mod.IndexRow(
                         content_hash=h,
-                        settings_fingerprint=fingerprint,
+                        settings_fingerprint=_fingerprint_for(f),
                         mode=res["mode"],
                         codec=res.get("codec"),
                         quality=res.get("quality"),
@@ -764,11 +1076,17 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     rows = []  # per-file ReportRow ledger (only materialized when --report given)
     for f in files:
         res = results[f]
-        _print_result(res, tag, dry_run)
-        if res["status"] in ("ok", "skipped-larger"):
+        # Videos carry their own tag: they are neither of the photo modes.
+        file_tag = tag if res["mode"] != "video" else (
+            "dry-run" if dry_run else "video"
+        )
+        _print_result(res, file_tag, dry_run)
+        if res["status"] in ("ok", "skipped-larger", "kept-original"):
             total_in += res["original_size"]
             total_out += res["compressed_size"]
             ok += 1
+        elif res["status"] == "would-encode":
+            ok += 1  # decided, but nothing measured — no size to total
         elif res["status"] == "skipped-unchanged":
             unchanged += 1
         if report_path:
