@@ -10,9 +10,13 @@ plays anywhere modern — opening the file *is* the restore. Aggressive mode
 deliberately does NOT port to video (per-frame AI SR is computationally absurd
 and temporally unstable); faithful-only is the honest scope.
 
-This module is the core library path (ROADMAP 10.1). The VMAF quality gate /
-auto-tune (10.2) and CLI/batch integration (10.3) build on it; nothing here is
-wired into ``facekeep compress`` yet.
+This module is the core library path (ROADMAP 10.1) plus the VMAF quality
+verification layer (10.2): every written encode is scored with libvmaf by
+default (order-paired frames, ``vmaf_4k`` at native resolution for 4K-class
+sources) and re-encoded a CRF step lower on a miss, and an opt-in sampled CRF
+auto-tune (``auto_tune=True``) searches the highest CRF that still meets the
+target. CLI/batch integration (10.3) builds on it; nothing here is wired into
+``facekeep compress`` yet.
 
 ``ffmpeg``/``ffprobe`` are **opt-in, machine-local external binaries** — the
 avifenc pattern: ``$FACEKEEP_FFMPEG`` -> PATH -> ``None``, never a Python
@@ -26,10 +30,11 @@ import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 from .exceptions import VideoError
 
@@ -61,6 +66,55 @@ _EFFICIENT_BPP = 0.05
 # for nothing regardless of bitrate. (Efficient HEVC/VP9 files are caught by
 # the bpp threshold instead — a *phone* HEVC is exactly what we want to shrink.)
 _EFFICIENT_CODECS = {"av1"}
+
+# --- VMAF quality verification / auto-tune (ROADMAP 10.2) --------------------
+#
+# Default target, in VMAF points of the per-frame **1%-low (p1)** — NOT the
+# mean. Measured basis (2026-07-16, the two real phone 4K clips, vmaf_4k at
+# native resolution): the pooled mean saturates at 98.6-99.8 across CRF 30-40
+# (it averages away localized damage — blind as a gate and useless as a tune
+# discriminator), while p1 moves ~1.5-2.5 points per 5 CRF, monotonically, and
+# is robust to a single odd frame. p1 also states the faithful promise
+# directly: the *worst* moments still look good, not the average. 93 sits
+# comfortably below the CRF-32 default's measured p1 (~94.6 iPhone / ~95.4
+# Android — the gate stays quiet on content the 10.0 spike eyeballed as
+# visually lossless) while catching a real miss (CRF 40 landed 90.7 / 92.7);
+# the gate exists for the content the fixed default was never validated on
+# (low light, heavy grain, fast motion).
+DEFAULT_VMAF_TARGET = 93.0
+
+# libvmaf built-in models (compiled into the library; no file, no download).
+_VMAF_MODEL_DEFAULT = "vmaf_v0.6.1"  # designed for 1080p viewing height
+_VMAF_MODEL_4K = "vmaf_4k_v0.6.1"  # designed for 4K viewing height
+# A source whose smaller dimension is at/above this scores with the 4K model
+# at native resolution. Measured on the real 4K clips: the default model at
+# the spike's downscale-to-1080p scored 99.5+ with a 0.02-0.12 CRF-30-vs-40
+# spread (saturated), while vmaf_4k at native discriminates (see the p1 note
+# above) — the 10.0 "revisit vmaf_4k" caveat, resolved.
+_VMAF_4K_MIN_DIM = 1800
+# Default-model sources larger than 1080p are downscaled to 1080p for scoring
+# (the model's design viewing height — the 10.0 spike convention).
+_VMAF_SCALE_MIN_DIM = 1080
+
+# Post-encode gate retry policy: a miss re-encodes _GATE_CRF_STEP lower
+# (measured: ~1.5-2.5 p1 points per 4-5 CRF), at most _GATE_MAX_RETRIES times
+# and never below _GATE_MIN_CRF; a still-missing floor keeps the best effort
+# with a warning — honest, and never an unbounded loop. The gate scores the
+# WHOLE file, deliberately un-subsampled: measured, n_subsample=2/4 inflated
+# this clip's p1 from 93.25 to 95.16 (the worst frames fall between samples —
+# exactly what a worst-frames gate exists to see) and only halved the cost.
+_GATE_CRF_STEP = 4
+_GATE_MAX_RETRIES = 2
+_GATE_MIN_CRF = 18
+
+# Sampled CRF auto-tune (opt-in): binary-search this inclusive CRF range for
+# the highest CRF whose sampled p1 still meets the target. Probes encode
+# _SAMPLE_SPAN_S-second spans centered at _SAMPLE_POSITIONS of the duration
+# (motion/light change over a clip — one sample lies); clips too short to be
+# worth sampling are probed whole.
+_TUNE_CRF_RANGE = (20, 55)
+_SAMPLE_SPAN_S = 3.0
+_SAMPLE_POSITIONS = (0.15, 0.5, 0.85)
 
 _MISSING_FFMPEG_HINT = (
     "ffmpeg not found (set FACEKEEP_FFMPEG to the binary or put ffmpeg on "
@@ -110,6 +164,35 @@ def ffmpeg_available() -> bool:
     return find_ffmpeg() is not None and _find_ffprobe() is not None
 
 
+_libvmaf_cache: Dict[str, bool] = {}
+
+
+def _ffmpeg_has_libvmaf(ffmpeg: str) -> bool:
+    """True if this ffmpeg build compiled the libvmaf filter in (cached)."""
+    cached = _libvmaf_cache.get(ffmpeg)
+    if cached is None:
+        try:
+            proc = subprocess.run([ffmpeg, "-hide_banner", "-filters"],
+                                  capture_output=True, text=True)
+            cached = proc.returncode == 0 and " libvmaf " in proc.stdout
+        except OSError:
+            cached = False
+        _libvmaf_cache[ffmpeg] = cached
+    return cached
+
+
+def vmaf_available() -> bool:
+    """True when ffmpeg/ffprobe are locatable AND this ffmpeg has libvmaf.
+
+    Not every ffmpeg build compiles libvmaf in (GPL builds from BtbN /
+    ffmpeg.org do). Encoding works without it — a libvmaf-less build only
+    loses the quality gate / auto-tune (skipped with a warning, never a
+    crash), the usual graceful-degradation chain.
+    """
+    ff = find_ffmpeg()
+    return ff is not None and _find_ffprobe() is not None and _ffmpeg_has_libvmaf(ff)
+
+
 def is_video_file(path: Union[str, Path]) -> bool:
     """Return True if the path's extension is a recognized video container."""
     return Path(path).suffix.lower() in VIDEO_EXTENSIONS
@@ -143,6 +226,17 @@ class VideoInfo:
 
 
 @dataclass
+class VmafScore:
+    """Pooled per-frame VMAF of one distorted-vs-reference comparison."""
+
+    mean: float
+    p1: float  # 1%-low: the score the worst 1% of frames still reach
+    min: float
+    frames: int
+    model: str  # the libvmaf model that scored this (default vs vmaf_4k)
+
+
+@dataclass
 class VideoResult:
     """Result of a faithful video compression."""
 
@@ -152,7 +246,10 @@ class VideoResult:
     compressed_size: int  # 0 when skipped
     skipped: bool = False
     skip_reason: Optional[str] = None
-    encode_seconds: float = 0.0  # wall time of the encode (per-file ETA in 10.3)
+    # Wall time of encode + quality verification (per-file ETA in 10.3).
+    encode_seconds: float = 0.0
+    crf_used: Optional[int] = None  # final encode's CRF (None when no encode ran)
+    vmaf: Optional[VmafScore] = None  # final gate score (None when gate off/unavailable)
 
     @property
     def ratio(self) -> float:
@@ -290,8 +387,206 @@ def default_output_path(input_path: Union[str, Path]) -> Path:
     return out
 
 
+def _vmaf_model_for(width: int, height: int) -> str:
+    """Pick the libvmaf model for a source size (min-dim: rotation-invariant)."""
+    if min(width, height) >= _VMAF_4K_MIN_DIM:
+        return _VMAF_MODEL_4K
+    return _VMAF_MODEL_DEFAULT
+
+
+def _vmaf_frame_scores(ffmpeg: str, distorted: Path, reference: Path, *,
+                       model: str, scale_to_1080: bool,
+                       ref_start: Optional[float] = None,
+                       ref_duration: Optional[float] = None) -> List[float]:
+    """Run libvmaf and return the per-frame VMAF scores.
+
+    Frames are paired by ORDER, not wall-clock timestamp (``settb`` +
+    ``setpts=N/(30*TB)`` on both branches): libvmaf's framesync pairs on
+    timestamps, and a VFR reference vs a re-encode misaligns catastrophically
+    (spike-measured: a flat false 19.6 on a visually perfect encode). N-based
+    setpts gives both branches identical synthetic timestamps, so frame i
+    compares against frame i. ``ref_start``/``ref_duration`` trim the
+    reference input for sample scoring (the distorted sample already is the
+    trimmed span); ``eof_action=endall`` stops at the shorter branch so a
+    boundary off-by-one frame never scores against a repeated frame.
+    """
+    scale = "scale=-2:1080:flags=bicubic," if scale_to_1080 else ""
+    opts = (f"model=version={model}:n_threads={os.cpu_count() or 1}:"
+            f"eof_action=endall:log_fmt=json:log_path=vmaf.json")
+    lavfi = (f"[0:v]{scale}settb=AVTB,setpts=N/(30*TB)[d];"
+             f"[1:v]{scale}settb=AVTB,setpts=N/(30*TB)[r];"
+             f"[d][r]libvmaf={opts}")
+    cmd = [ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error",
+           "-i", str(distorted)]
+    if ref_start:
+        cmd += ["-ss", f"{ref_start:.3f}"]
+    if ref_duration is not None:
+        cmd += ["-t", f"{ref_duration:.3f}"]
+    cmd += ["-i", str(reference), "-lavfi", lavfi, "-f", "null", "-"]
+    # log_path stays a bare filename + cwd=temp dir: a Windows drive-letter
+    # path inside a filtergraph is an escaping tarpit (the 10.0 lesson).
+    with tempfile.TemporaryDirectory(prefix="facekeep_vmaf_") as td:
+        proc = subprocess.run(cmd, capture_output=True, text=True, cwd=td)
+        if proc.returncode != 0:
+            raise VideoError(
+                f"VMAF scoring failed on {Path(distorted).name}: "
+                f"{proc.stderr.strip()[-500:]}"
+            )
+        data = json.loads((Path(td) / "vmaf.json").read_text(encoding="utf-8"))
+    scores = [f["metrics"]["vmaf"] for f in data.get("frames", [])]
+    if not scores:
+        raise VideoError(f"VMAF produced no frame scores for {Path(distorted).name}")
+    return scores
+
+
+def _pool_scores(scores: List[float], model: str) -> VmafScore:
+    ordered = sorted(scores)
+    n = len(ordered)
+    return VmafScore(
+        mean=sum(ordered) / n,
+        p1=ordered[max(0, n // 100 - 1)],
+        min=ordered[0],
+        frames=n,
+        model=model,
+    )
+
+
+def score_vmaf(distorted: Union[str, Path], reference: Union[str, Path], *,
+               reference_info: Optional[VideoInfo] = None,
+               ref_start: Optional[float] = None,
+               ref_duration: Optional[float] = None) -> VmafScore:
+    """Score ``distorted`` against ``reference`` with libvmaf, pooled per-frame.
+
+    The model follows the *reference* size (``_vmaf_model_for``): 4K-class
+    sources (min dimension >= ``_VMAF_4K_MIN_DIM``) score with ``vmaf_4k`` at
+    native resolution — measured, the default model at a 1080p downscale is
+    saturated blind on 4K — and everything else scores with the default model,
+    downscaled to its 1080p design height when larger. Pass ``reference_info``
+    when the caller already probed (skips a redundant ffprobe run).
+
+    Raises :class:`VideoError` when ffmpeg/libvmaf are unavailable or scoring
+    fails.
+    """
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None or _find_ffprobe() is None:
+        raise VideoError(_MISSING_FFMPEG_HINT)
+    if not _ffmpeg_has_libvmaf(ffmpeg):
+        raise VideoError(
+            "this ffmpeg build has no libvmaf filter; VMAF scoring needs one "
+            "(e.g. a GPL build from ffmpeg.org/BtbN). Encoding works without it."
+        )
+    info = reference_info if reference_info is not None else probe_video(reference)
+    model = _vmaf_model_for(info.width, info.height)
+    scale = (model == _VMAF_MODEL_DEFAULT
+             and min(info.width, info.height) > _VMAF_SCALE_MIN_DIM)
+    scores = _vmaf_frame_scores(
+        ffmpeg, Path(distorted), Path(reference), model=model,
+        scale_to_1080=scale, ref_start=ref_start, ref_duration=ref_duration,
+    )
+    return _pool_scores(scores, model)
+
+
+def _sample_spans(duration_s: float) -> List[Tuple[float, float]]:
+    """The (start, duration) spans the CRF auto-tune probes.
+
+    Three short spans spread through the file; a clip too short for sampling
+    to be worth it (or an unknown duration) is probed whole/from the head.
+    """
+    span = _SAMPLE_SPAN_S
+    if duration_s <= 0 or duration_s <= 2 * span * len(_SAMPLE_POSITIONS):
+        return [(0.0, max(duration_s, span))]
+    return [(round(max(0.0, duration_s * pos - span / 2), 3), span)
+            for pos in _SAMPLE_POSITIONS]
+
+
+def find_crf(input_path: Union[str, Path], *, target: float = DEFAULT_VMAF_TARGET,
+             preset: int = DEFAULT_PRESET,
+             info: Optional[VideoInfo] = None) -> Tuple[int, VmafScore]:
+    """Sampled CRF search: the highest CRF whose sampled VMAF p1 meets ``target``.
+
+    The photo auto-tune analog (ab-av1 style): binary-search
+    ``_TUNE_CRF_RANGE``, and per probed CRF encode the sample spans at the
+    *real* preset/pixel format, score them order-paired against the same
+    source spans, and pool all spans' frame scores into one p1. Returns
+    ``(crf, sampled_score)``. When even the range's quality end misses the
+    target, that end is returned with a warning — best effort, never an error.
+
+    Raises :class:`VideoError` when ffmpeg/libvmaf are unavailable or a probe
+    fails. Cost note: each probe is a real (short) encode + score, so a search
+    runs ~6 of them; on a clip short enough to be probed whole this approaches
+    6x the single-encode cost — auto-tune is the opt-in path for a reason.
+    """
+    src = Path(input_path)
+    ffmpeg = find_ffmpeg()
+    if ffmpeg is None or _find_ffprobe() is None:
+        raise VideoError(_MISSING_FFMPEG_HINT)
+    if not _ffmpeg_has_libvmaf(ffmpeg):
+        raise VideoError(
+            "this ffmpeg build has no libvmaf filter; the CRF auto-tune needs "
+            "one (e.g. a GPL build from ffmpeg.org/BtbN)."
+        )
+    if info is None:
+        info = probe_video(src)
+    model = _vmaf_model_for(info.width, info.height)
+    scale = (model == _VMAF_MODEL_DEFAULT
+             and min(info.width, info.height) > _VMAF_SCALE_MIN_DIM)
+    spans = _sample_spans(info.duration_s)
+    ten_bit = info.bit_depth > 8
+
+    with tempfile.TemporaryDirectory(prefix="facekeep_tune_") as td:
+
+        def sampled_score(crf: int) -> VmafScore:
+            scores: List[float] = []
+            for i, (start, dur) in enumerate(spans):
+                sample = Path(td) / f"sample_{crf}_{i}.mp4"
+                cmd = _encode_command(ffmpeg, src, sample, crf=crf, preset=preset,
+                                      ten_bit=ten_bit, start=start, duration=dur,
+                                      sample=True)
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0:
+                    raise VideoError(
+                        f"auto-tune sample encode failed on {src.name}: "
+                        f"{proc.stderr.strip()[-500:]}"
+                    )
+                scores.extend(_vmaf_frame_scores(
+                    ffmpeg, sample, src, model=model, scale_to_1080=scale,
+                    ref_start=start, ref_duration=dur,
+                ))
+            return _pool_scores(scores, model)
+
+        lo, hi = _TUNE_CRF_RANGE
+        best: Optional[Tuple[int, VmafScore]] = None
+        floor_score: Optional[VmafScore] = None
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            score = sampled_score(mid)
+            logger.debug("auto-tune probe %s crf=%d: p1=%.2f (target %.1f)",
+                         src.name, mid, score.p1, target)
+            if score.p1 >= target:
+                best = (mid, score)
+                lo = mid + 1
+            else:
+                if mid == _TUNE_CRF_RANGE[0]:
+                    floor_score = score
+                hi = mid - 1
+
+    if best is None:
+        # All probes missed; the last one was necessarily the range's quality
+        # end (lo never moves on a miss), so floor_score is always set here.
+        floor = _TUNE_CRF_RANGE[0]
+        logger.warning(
+            "%s: even crf=%d misses the sampled VMAF p1 target %.1f "
+            "(got %.2f); using it as the best effort.",
+            src.name, floor, target, floor_score.p1,
+        )
+        return floor, floor_score
+    return best
+
+
 def _encode_command(ffmpeg: str, src: Path, tmp: Path, *, crf: int, preset: int,
-                    ten_bit: bool) -> List[str]:
+                    ten_bit: bool, start: Optional[float] = None,
+                    duration: Optional[float] = None,
+                    sample: bool = False) -> List[str]:
     """Build the SVT-AV1 re-encode command (the hardened 10.0 spike command).
 
     Deliberate policies, each a ROADMAP 10.0 finding:
@@ -318,19 +613,33 @@ def _encode_command(ffmpeg: str, src: Path, tmp: Path, *, crf: int, preset: int,
       cosmetic quirk: ``use_metadata_tags`` stores ``creation_time`` in both
       the mvhd atom and an mdta tag, so ffprobe shows the value twice
       (';'-joined); players/indexers read the mvhd one.
+
+    ``sample=True`` (auto-tune probes, 10.2) encodes a video-only span meant
+    solely to be VMAF-scored and thrown away: ``start``/``duration`` trim it
+    (input seek — frame-accurate when transcoding), audio and metadata are
+    dropped. All the video policies above stay identical, so the probe
+    measures exactly what the real encode would do.
     """
-    return [
-        ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error",
-        "-i", str(src),
-        "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "0",
+    cmd = [ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error"]
+    if start:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(src)]
+    if duration is not None:
+        cmd += ["-t", f"{duration:.3f}"]
+    if sample:
+        cmd += ["-map", "0:v:0", "-an"]
+    else:
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "0"]
+    cmd += [
         "-fps_mode", "passthrough",
         "-c:v", "libsvtav1", "-crf", str(crf), "-preset", str(preset),
         "-svtav1-params", "tune=0",
         "-pix_fmt", "yuv420p10le" if ten_bit else "yuv420p",
-        "-c:a", "copy",
-        "-movflags", "+faststart+use_metadata_tags",
-        "-f", "mp4", str(tmp),
     ]
+    if not sample:
+        cmd += ["-c:a", "copy"]
+    cmd += ["-movflags", "+faststart+use_metadata_tags", "-f", "mp4", str(tmp)]
+    return cmd
 
 
 def compress_video(
@@ -340,13 +649,28 @@ def compress_video(
     crf: int = DEFAULT_CRF,
     preset: int = DEFAULT_PRESET,
     skip_efficient: bool = True,
+    vmaf_target: Optional[float] = DEFAULT_VMAF_TARGET,
+    auto_tune: bool = False,
 ) -> VideoResult:
     """Faithfully re-encode a phone video to SVT-AV1 in a standard ``.mp4``.
 
-    The full path: probe -> skip-if-efficient -> encode (VFR-safe, HDR/VUI
-    passthrough, metadata carried, first audio copied) -> skip-if-larger.
-    The encode writes to a temp file and renames on success, so a failed or
-    skipped run never leaves a partial output.
+    The full path: probe -> skip-if-efficient -> [opt-in sampled CRF
+    auto-tune] -> encode (VFR-safe, HDR/VUI passthrough, metadata carried,
+    first audio copied) -> VMAF quality gate -> skip-if-larger. The encode
+    writes to a temp file and renames on success, so a failed or skipped run
+    never leaves a partial output.
+
+    Quality verification (ROADMAP 10.2): every written encode is VMAF-scored
+    against the source by default (order-paired frames; ``vmaf_4k`` at native
+    resolution for 4K-class sources) and re-encoded ``_GATE_CRF_STEP`` lower
+    on a p1-below-``vmaf_target`` miss, at most ``_GATE_MAX_RETRIES`` times —
+    the safety net for content the fixed CRF default was never measured on.
+    ``vmaf_target=None`` disables the gate (halves the pipeline cost on 4K:
+    scoring is roughly as expensive as encoding). ``auto_tune=True`` (opt-in)
+    first searches the highest CRF whose *sampled* p1 meets the target
+    (:func:`find_crf`), replacing the fixed ``crf``; the gate then verifies
+    the whole file. Both degrade gracefully to the plain fixed-CRF encode
+    (warned, unverified) when this ffmpeg build lacks libvmaf.
 
     A skip writes nothing and returns ``skipped=True`` with the reason —
     keep-the-original semantics are the caller's job (CLI integration, 10.3).
@@ -373,6 +697,26 @@ def compress_video(
                 compressed_size=0, skipped=True, skip_reason=reason,
             )
 
+    want_vmaf = vmaf_target is not None or auto_tune
+    have_vmaf = _ffmpeg_has_libvmaf(ffmpeg) if want_vmaf else False
+    if want_vmaf and not have_vmaf:
+        logger.warning(
+            "%s: this ffmpeg build has no libvmaf; VMAF quality %s skipped - "
+            "encoding at fixed crf=%d, unverified.",
+            src.name, "gate + auto-tune" if auto_tune else "gate", crf,
+        )
+
+    t0 = time.perf_counter()
+    chosen_crf = crf
+    if auto_tune and have_vmaf:
+        tune_target = vmaf_target if vmaf_target is not None else DEFAULT_VMAF_TARGET
+        chosen_crf, sampled = find_crf(src, target=tune_target, preset=preset,
+                                       info=info)
+        logger.info(
+            "%s: auto-tune chose crf=%d (sampled VMAF p1=%.2f, target %.1f)",
+            src.name, chosen_crf, sampled.p1, tune_target,
+        )
+
     out = Path(output_path) if output_path is not None else default_output_path(src)
     if os.path.normcase(os.path.abspath(out)) == os.path.normcase(os.path.abspath(src)):
         raise VideoError(
@@ -381,15 +725,39 @@ def compress_video(
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_name(out.name + ".part")
 
-    cmd = _encode_command(ffmpeg, src, tmp, crf=crf, preset=preset,
-                          ten_bit=info.bit_depth > 8)
-    t0 = time.perf_counter()
+    score: Optional[VmafScore] = None
+    attempt_crf = chosen_crf
+    retries = 0
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode != 0:
-            raise VideoError(
-                f"ffmpeg encode failed on {src.name}: {proc.stderr.strip()[-1000:]}"
+        while True:
+            cmd = _encode_command(ffmpeg, src, tmp, crf=attempt_crf, preset=preset,
+                                  ten_bit=info.bit_depth > 8)
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise VideoError(
+                    f"ffmpeg encode failed on {src.name}: {proc.stderr.strip()[-1000:]}"
+                )
+            if vmaf_target is None or not have_vmaf:
+                break
+            score = score_vmaf(tmp, src, reference_info=info)
+            if score.p1 >= vmaf_target:
+                break
+            if retries >= _GATE_MAX_RETRIES or attempt_crf <= _GATE_MIN_CRF:
+                logger.warning(
+                    "%s: VMAF p1=%.2f still below target %.1f at crf=%d; "
+                    "keeping the best effort (mean=%.2f).",
+                    src.name, score.p1, vmaf_target, attempt_crf, score.mean,
+                )
+                break
+            retries += 1
+            new_crf = max(attempt_crf - _GATE_CRF_STEP, _GATE_MIN_CRF)
+            logger.info(
+                "%s: VMAF p1=%.2f below target %.1f at crf=%d; re-encoding at "
+                "crf=%d (retry %d/%d).",
+                src.name, score.p1, vmaf_target, attempt_crf, new_crf,
+                retries, _GATE_MAX_RETRIES,
             )
+            attempt_crf = new_crf
         encode_seconds = time.perf_counter() - t0
         compressed_size = tmp.stat().st_size
 
@@ -404,7 +772,7 @@ def compress_video(
             return VideoResult(
                 input_path=src, output_path=None, original_size=original_size,
                 compressed_size=0, skipped=True, skip_reason=reason,
-                encode_seconds=encode_seconds,
+                encode_seconds=encode_seconds, crf_used=attempt_crf, vmaf=score,
             )
         os.replace(tmp, out)
     finally:
@@ -412,11 +780,14 @@ def compress_video(
             tmp.unlink(missing_ok=True)
 
     logger.info(
-        "Compressed %s -> %s: %.1f MB -> %.1f MB (%.1fx) in %.0fs",
+        "Compressed %s -> %s: %.1f MB -> %.1f MB (%.1fx) in %.0fs%s",
         src.name, out.name, original_size / 1e6, compressed_size / 1e6,
         original_size / compressed_size, encode_seconds,
+        "" if score is None else
+        f" (crf={attempt_crf}, VMAF p1={score.p1:.2f} mean={score.mean:.2f})",
     )
     return VideoResult(
         input_path=src, output_path=out, original_size=original_size,
         compressed_size=compressed_size, encode_seconds=encode_seconds,
+        crf_used=attempt_crf, vmaf=score,
     )
