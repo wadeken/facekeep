@@ -109,6 +109,9 @@ def test_video_config_defaults_mirror_video_module():
     assert cfg.video.vmaf_target == video.DEFAULT_VMAF_TARGET
     assert cfg.video.auto_tune is False
     assert cfg.video.skip_efficient is True
+    assert cfg.video.preserve_dolby_vision is True
+    assert cfg.video.face_aware is True
+    assert cfg.video.face_vmaf_target == video.DEFAULT_FACE_VMAF_TARGET
 
 
 def test_video_config_yaml_load_records_explicit_keys(tmp_path):
@@ -125,6 +128,7 @@ def test_video_config_yaml_load_records_explicit_keys(tmp_path):
 @pytest.mark.parametrize("field,value", [
     ("crf", -1), ("crf", 64), ("preset", 14), ("preset", -1),
     ("vmaf_target", 0.0), ("vmaf_target", 101.0),
+    ("face_vmaf_target", 0.0), ("face_vmaf_target", 101.0),
 ])
 def test_video_config_validation_rejects_bad_values(field, value):
     cfg = FaceKeepConfig()
@@ -151,7 +155,9 @@ def test_video_fingerprint_busts_on_every_video_knob():
     base = FaceKeepConfig()
     fp0 = index_mod.video_settings_fingerprint(base)
     for field, value in [("crf", 40), ("preset", 4), ("vmaf_target", None),
-                         ("auto_tune", True), ("skip_efficient", False)]:
+                         ("auto_tune", True), ("skip_efficient", False),
+                         ("preserve_dolby_vision", False),
+                         ("face_aware", False), ("face_vmaf_target", 97.0)]:
         cfg = FaceKeepConfig()
         setattr(cfg.video, field, value)
         assert index_mod.video_settings_fingerprint(cfg) != fp0, field
@@ -174,9 +180,52 @@ def test_video_and_photo_fingerprints_are_independent():
     assert index_mod.settings_fingerprint(video_changed) == photo_fp
 
 
+def test_video_fingerprint_detector_coupling_follows_face_aware():
+    """The shared detector busts video caches iff face-aware consumes it.
+
+    With face_aware on (the default), the detector fields that change *whether
+    a face is found* are output-affecting for videos too (they can raise the
+    VMAF target) -> a backend change busts. Box-shaping fields (padding/roi)
+    and, with face_aware off, ALL detector fields never bust a cached video
+    encode (minutes-to-hours each — the 10.3 independence promise).
+    """
+    base = FaceKeepConfig()
+    fp0 = index_mod.video_settings_fingerprint(base)
+
+    found_changed = FaceKeepConfig()
+    found_changed.detector.backend = "yunet"
+    assert index_mod.video_settings_fingerprint(found_changed) != fp0
+
+    shape_changed = FaceKeepConfig()
+    shape_changed.detector.padding = 2.0
+    shape_changed.detector.roi = "person"
+    assert index_mod.video_settings_fingerprint(shape_changed) == fp0
+
+    off_base = FaceKeepConfig()
+    off_base.video.face_aware = False
+    off_fp = index_mod.video_settings_fingerprint(off_base)
+    off_changed = FaceKeepConfig()
+    off_changed.video.face_aware = False
+    off_changed.detector.backend = "yunet"
+    off_changed.detector.confidence = 0.9
+    assert index_mod.video_settings_fingerprint(off_changed) == off_fp
+
+
 # --------------------------------------------------------------------------- #
 # Report: the vmaf_p1 column
 # --------------------------------------------------------------------------- #
+
+def test_video_report_row_carries_faces_and_dv_note():
+    """A video row fills the faces column (10.5) and the OK line says DV."""
+    res = {"file": "a.mov", "mode": "video", "status": "ok", "codec": "av1",
+           "quality": 28, "original_size": 100, "compressed_size": 50,
+           "ratio": 2.0, "vmaf_p1": 95.1, "faces": 2, "dolby_vision": True,
+           "output_name": "a.mp4", "encode_seconds": 3.0}
+    row = cli_mod._row_from_result(res, dry_run=False)
+    assert row.status == "written"
+    assert row.faces == 2
+    assert row.vmaf_p1 == 95.1
+
 
 def test_report_vmaf_p1_column_is_last_and_honest(tmp_path):
     assert report.FIELDNAMES[-1] == "vmaf_p1"

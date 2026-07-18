@@ -374,7 +374,8 @@ def _keep_original_video(src: Path, target: Path) -> Path:
 
 
 def _process_one_video(file_str: str, target: str, video_config,
-                       dry_run: bool) -> dict:
+                       dry_run: bool, detector=None,
+                       face_aware_ok: bool = True) -> dict:
     """Compress a single video and return a result dict (parent-process only).
 
     The video sibling of :func:`_process_one`. It always runs serially in the
@@ -396,6 +397,13 @@ def _process_one_video(file_str: str, target: str, video_config,
     the SVT-AV1 CRF used and ``vmaf_p1`` the gate's 1%-low score when it ran.
     ``output_path`` is the absolute artifact path (output or kept original),
     which the index records verbatim.
+
+    ``detector`` is the parent-built shared face detector for face-aware
+    quality (10.5; ``None`` lets the library default to Haar);
+    ``face_aware_ok=False`` disables face-aware for this run — the caller
+    could not construct the *configured* detector, and a custom backend is
+    never silently swapped for Haar (the plugin rule), so the honest fallback
+    is the base target.
     """
     f = Path(file_str)
     result: dict = {"file": f.name, "mode": "video"}
@@ -417,12 +425,19 @@ def _process_one_video(file_str: str, target: str, video_config,
                     quality=video_config.crf, output_name=Path(target).name,
                 )
         else:
+            face_target = (
+                video_config.face_vmaf_target
+                if face_aware_ok and video_config.face_aware else None
+            )
             res = video_mod.compress_video(
                 f, target,
                 crf=video_config.crf, preset=video_config.preset,
                 skip_efficient=video_config.skip_efficient,
                 vmaf_target=video_config.vmaf_target,
                 auto_tune=video_config.auto_tune,
+                preserve_dolby_vision=video_config.preserve_dolby_vision,
+                face_vmaf_target=face_target,
+                detector=detector,
             )
             if res.skipped:
                 kept = _keep_original_video(f, Path(target))
@@ -432,6 +447,7 @@ def _process_one_video(file_str: str, target: str, video_config,
                     compressed_size=res.original_size, ratio=1.0,
                     quality=res.crf_used, output_name=kept.name,
                     output_path=str(kept), encode_seconds=res.encode_seconds,
+                    faces=res.faces,
                 )
             else:
                 result.update(
@@ -443,6 +459,7 @@ def _process_one_video(file_str: str, target: str, video_config,
                     output_name=res.output_path.name,
                     output_path=str(res.output_path),
                     encode_seconds=res.encode_seconds,
+                    faces=res.faces, dolby_vision=res.dolby_vision,
                 )
     except SkipFileError as e:
         result.update(status="skipped", error=str(e))
@@ -480,10 +497,13 @@ def _print_result(res: dict, tag: str, dry_run: bool) -> None:
         else:  # encoded + written
             vmaf = res.get("vmaf_p1")
             vmaf_note = "" if vmaf is None else f", VMAF p1={vmaf:.1f}"
+            dv_note = ", DV" if res.get("dolby_vision") else ""
+            faces = res.get("faces")
+            face_note = f", {faces} face(s)" if faces else ""
             click.echo(
                 f"OK  {_fmt_size(res['original_size'])} -> "
                 f"{_fmt_size(res['compressed_size'])} ({res['ratio']:.1f}x, "
-                f"av1 crf{res['quality']}{vmaf_note}, "
+                f"av1 crf{res['quality']}{dv_note}{face_note}{vmaf_note}, "
                 f"in {_fmt_duration(res.get('encode_seconds') or 0)}) "
                 f"-> {res['output_name']}"
             )
@@ -547,6 +567,7 @@ def _row_from_result(res: dict, dry_run: bool) -> report.ReportRow:
             codec=res.get("codec"), quality=res.get("quality"),
             original_bytes=res.get("original_size"),
             output_bytes=res.get("compressed_size"), ratio=res.get("ratio"),
+            faces=res.get("faces"),
             vmaf_p1=res.get("vmaf_p1"), output_path=res.get("output_name"),
         )
     if res["mode"] == "faithful":
@@ -986,6 +1007,34 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
         if detect_cache is not None:
             detect_cache.close()
 
+    # Face-aware video quality (10.5): build the *configured* shared detector
+    # once in the parent — videos are always serial, so one instance serves the
+    # whole run (the detection-cache/hand-detector parent-only discipline).
+    # If the configured detector cannot be constructed (a broken custom
+    # backend), face-aware is disabled for the run instead of silently
+    # substituting Haar — a plugin owns its own degradation.
+    video_detector = None
+    video_face_aware_ok = True
+    if to_process_videos and config.video.face_aware and not dry_run:
+        try:
+            from .detector import create_detector
+
+            video_detector = create_detector(
+                backend=config.detector.backend,
+                confidence=config.detector.confidence,
+                padding=config.detector.padding,
+                nms_iou=config.detector.nms_iou,
+                min_size_ratio=config.detector.min_size_ratio,
+                max_aspect_ratio=config.detector.max_aspect_ratio,
+                roi=config.detector.roi,
+            )
+        except Exception as e:  # noqa: BLE001 - detection never blocks videos
+            logging.getLogger("facekeep.cli").warning(
+                "Could not construct the configured face detector (%s); "
+                "face-aware video quality disabled for this run.", e
+            )
+            video_face_aware_ok = False
+
     # Videos: serial, in the parent (see the split above). Each real encode is
     # announced up front on stderr with the clip's size/length and an ETA
     # derived from the throughput (pixels per wall-second, encode + quality
@@ -1020,7 +1069,9 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                     f"{_fmt_duration(vinfo.duration_s)} - encoding ({eta})",
                     err=True,
                 )
-        res = _process_one_video(str(f), targets[f], config.video, dry_run)
+        res = _process_one_video(str(f), targets[f], config.video, dry_run,
+                                 detector=video_detector,
+                                 face_aware_ok=video_face_aware_ok)
         results[f] = res
         secs = res.get("encode_seconds") or 0.0
         if res["status"] == "ok" and pixels and secs > 0:

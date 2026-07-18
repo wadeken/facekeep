@@ -188,15 +188,27 @@ def settings_fingerprint(config: FaceKeepConfig) -> str:
 def video_settings_fingerprint(config: FaceKeepConfig) -> str:
     """Fingerprint of the video knobs — videos cache independently of photos.
 
-    A video's output bytes depend only on the ``video:`` section, never on the
-    photo mode/codec/detector settings (and vice versa), so videos get their own
-    fingerprint: retuning the photo quality must not re-encode every video in
-    the folder (a video re-encode costs minutes-to-hours, the exact work the
-    index exists to skip). Every field here is output-affecting: ``crf``/
-    ``preset`` set the encode, ``vmaf_target`` can lower the CRF via the gate,
-    ``auto_tune`` replaces the fixed CRF per clip, and ``skip_efficient``
-    decides whether an output exists at all. (``enabled`` is not hashed — it
-    only selects which files are gathered, like a CLI path argument.)
+    A video's output bytes depend only on the ``video:`` section (plus, when
+    ``face_aware`` is on, the shared detector's *detection-outcome* fields —
+    see below), never on the photo mode/codec settings (and vice versa), so
+    videos get their own fingerprint: retuning the photo quality must not
+    re-encode every video in the folder (a video re-encode costs
+    minutes-to-hours, the exact work the index exists to skip). Every field
+    here is output-affecting: ``crf``/``preset`` set the encode,
+    ``vmaf_target`` can lower the CRF via the gate, ``auto_tune`` replaces the
+    fixed CRF per clip, ``skip_efficient`` decides whether an output exists at
+    all, ``preserve_dolby_vision`` adds/drops the per-frame RPU bytes, and the
+    ``face_aware``/``face_vmaf_target`` pair can raise the gate target (10.5).
+    (``enabled`` is not hashed — it only selects which files are gathered,
+    like a CLI path argument.)
+
+    Face-aware detection makes the *effective detector* output-affecting for
+    videos too, so with ``face_aware`` on the detector fields that change
+    *whether a face is found* are hashed (backend/confidence/nms_iou/
+    min_size_ratio/max_aspect_ratio — the honesty rule). ``padding``/``roi``
+    are excluded: they only reshape boxes, never the found-vs-not answer the
+    video path consumes. With ``face_aware`` off the detector dict is omitted
+    entirely, so retuning the detector then never busts cached video encodes.
     """
     relevant = {
         "mode": "video",
@@ -205,7 +217,19 @@ def video_settings_fingerprint(config: FaceKeepConfig) -> str:
         "vmaf_target": config.video.vmaf_target,
         "auto_tune": config.video.auto_tune,
         "skip_efficient": config.video.skip_efficient,
+        "preserve_dolby_vision": config.video.preserve_dolby_vision,
+        "face_aware": config.video.face_aware,
+        "face_vmaf_target": config.video.face_vmaf_target,
     }
+    if config.video.face_aware:
+        d = config.detector
+        relevant["detector"] = {
+            "backend": d.backend,
+            "confidence": d.confidence,
+            "nms_iou": d.nms_iou,
+            "min_size_ratio": d.min_size_ratio,
+            "max_aspect_ratio": d.max_aspect_ratio,
+        }
     blob = json.dumps(relevant, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 

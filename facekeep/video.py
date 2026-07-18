@@ -21,6 +21,23 @@ in the incremental index under their own fingerprint, and always encoded
 serially in the parent process (SVT-AV1 saturates the cores — ``--jobs``
 applies to photos only).
 
+ROADMAP 10.5 adds two faithful refinements. **Dolby Vision RPU carry**
+(``preserve_dolby_vision``, default on): a phone DV source (both real phones
+record DV profile 8.4 — an HLG base plus a per-frame tone-mapping RPU) keeps
+its RPU through the re-encode as AV1 T.35 metadata OBUs (DV profile 10), so a
+DV-aware display renders the output through the same Dolby pipeline as the
+original — the 10.4 device finding ("the original looks more saturated") was
+exactly this refinement layer missing. No ``dovi_tool`` needed: this ffmpeg's
+libsvtav1 wrapper codes the RPU itself (``-dolbyvision``; the mp4 DV-AV1 box
+needs ``-strict unofficial``), verified per-frame value-identical on both real
+clips. A build without the option keeps today's HLG-base output, warned.
+**Face-aware quality** (``face_vmaf_target``, default 95): the photo
+chroma/auto-tune analog — the shared face detector runs on a few sampled
+frames, and when faces are present the VMAF p1 target rises so the gate (and
+the auto-tune search) hold the clip to a higher floor; family clips are what
+the tool exists for. A missed face just keeps today's target; a false positive
+only costs bytes — the same benign failure modes as the photo guardrails.
+
 ``ffmpeg``/``ffprobe`` are **opt-in, machine-local external binaries** — the
 avifenc pattern: ``$FACEKEEP_FFMPEG`` -> PATH -> ``None``, never a Python
 dependency, fully offline. Photos are unaffected when they are missing.
@@ -85,6 +102,18 @@ _EFFICIENT_CODECS = {"av1"}
 # the gate exists for the content the fixed default was never validated on
 # (low light, heavy grain, fast motion).
 DEFAULT_VMAF_TARGET = 93.0
+
+# Face-aware quality (ROADMAP 10.5): the VMAF p1 target used when faces are
+# detected on sampled frames (the photo chroma/auto-tune analog — faces are
+# the subject, so the worst moments must clear a higher bar). Measured basis:
+# at the default CRF 32 the two real phone clips landed p1 94.5 (iPhone, a
+# person on camera) and 95.4 (Android, a large face) — 95 gives the borderline
+# face clip exactly one gate step of extra quality (CRF 28) while a clip that
+# already clears it stays single-pass. Detection failure or zero faces keeps
+# the base target (never worse than today); a Haar false positive only raises
+# quality/size, never corrupts — the same benign failure mode as the photo
+# guardrails.
+DEFAULT_FACE_VMAF_TARGET = 95.0
 
 # libvmaf built-in models (compiled into the library; no file, no download).
 _VMAF_MODEL_DEFAULT = "vmaf_v0.6.1"  # designed for 1080p viewing height
@@ -196,6 +225,32 @@ def vmaf_available() -> bool:
     return ff is not None and _find_ffprobe() is not None and _ffmpeg_has_libvmaf(ff)
 
 
+_dovi_encode_cache: Dict[str, bool] = {}
+
+
+def _ffmpeg_supports_dovi_encode(ffmpeg: str) -> bool:
+    """True if this build's libsvtav1 wrapper can code Dolby Vision RPUs.
+
+    Detected off ``-h encoder=libsvtav1`` listing a ``dolbyvision`` option
+    (present in 2025+ ffmpeg with a matching SVT-AV1 — the wrapper converts
+    the decoder-exported per-frame RPU into AV1 T.35 metadata OBUs, DV
+    profile 10). An older build simply lacks the option; the encode then
+    proceeds without DV, warned — the HLG/HDR10 base layer is unaffected.
+    Cached per binary path, like :func:`_ffmpeg_has_libvmaf`.
+    """
+    cached = _dovi_encode_cache.get(ffmpeg)
+    if cached is None:
+        try:
+            proc = subprocess.run([ffmpeg, "-hide_banner", "-h",
+                                   "encoder=libsvtav1"],
+                                  capture_output=True, text=True)
+            cached = proc.returncode == 0 and "dolbyvision" in proc.stdout
+        except OSError:
+            cached = False
+        _dovi_encode_cache[ffmpeg] = cached
+    return cached
+
+
 def is_video_file(path: Union[str, Path]) -> bool:
     """Return True if the path's extension is a recognized video container."""
     return Path(path).suffix.lower() in VIDEO_EXTENSIONS
@@ -220,6 +275,9 @@ class VideoInfo:
     color_space: Optional[str]
     rotation: int  # display-matrix rotation in degrees (0 when none)
     a_codec: Optional[str]
+    # Dolby Vision: the source's DV profile (e.g. 8 for phone 8.4 HLG-base DV)
+    # when a DOVI configuration record with an RPU is present, else None.
+    dovi_profile: Optional[int] = None
 
     @property
     def bits_per_pixel_frame(self) -> float:
@@ -253,6 +311,10 @@ class VideoResult:
     encode_seconds: float = 0.0
     crf_used: Optional[int] = None  # final encode's CRF (None when no encode ran)
     vmaf: Optional[VmafScore] = None  # final gate score (None when gate off/unavailable)
+    # 10.5: True when the source's Dolby Vision RPU was carried into the output.
+    dolby_vision: bool = False
+    # 10.5: max faces the sampled-frame detection saw (None = it never ran).
+    faces: Optional[int] = None
 
     @property
     def ratio(self) -> float:
@@ -306,19 +368,24 @@ def probe_video(path: Union[str, Path]) -> VideoInfo:
     if not bit_depth:
         bit_depth = 12 if "12" in pix_fmt else 10 if "10" in pix_fmt else 8
 
+    def _int(value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
     rotation = 0
+    dovi_profile = None
     for sd in video.get("side_data_list", []) or []:
         if "rotation" in sd:
             try:
                 rotation = int(float(sd["rotation"]))
             except (TypeError, ValueError):
                 pass
-
-    def _int(value) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return 0
+        # A DOVI configuration record identifies a Dolby Vision source; only an
+        # RPU-bearing one has per-frame metadata worth carrying (10.5).
+        if "dv_profile" in sd and _int(sd.get("rpu_present_flag")):
+            dovi_profile = _int(sd.get("dv_profile"))
 
     return VideoInfo(
         path=src,
@@ -336,6 +403,7 @@ def probe_video(path: Union[str, Path]) -> VideoInfo:
         color_space=video.get("color_space"),
         rotation=rotation,
         a_codec=audio.get("codec_name") if audio else None,
+        dovi_profile=dovi_profile,
     )
 
 
@@ -603,10 +671,63 @@ def find_crf(input_path: Union[str, Path], *, target: float = DEFAULT_VMAF_TARGE
     return best
 
 
+def _sampled_face_count(ffmpeg: str, src: Path, info: VideoInfo,
+                        detector=None) -> int:
+    """Max face count the detector sees across a few sampled frames (10.5).
+
+    The video counterpart of the photo pipeline's detect step, scoped to one
+    question: *does this clip contain faces?* Frames at ``_SAMPLE_POSITIONS``
+    (the auto-tune spans' positions — one mechanism) are extracted upright
+    (ffmpeg autorotates, matching the encode) to a temp PNG and run through
+    ``detector`` (any ``FaceDetector``; ``None`` builds the default offline
+    Haar). Sampling is honest-but-cheap: a face that only appears between
+    samples is missed and the clip just keeps the base target — never worse
+    than not looking.
+
+    Detection must never fail the pipeline (the photo rule): any error —
+    extraction, decode, the detector itself — logs a warning and counts as
+    zero faces.
+    """
+    try:
+        import cv2  # a core dependency; imported lazily so the module stays
+        # stdlib-only at import time (config.py imports it for the defaults)
+
+        if detector is None:
+            from .detector import create_detector
+
+            detector = create_detector()
+        positions = ([max(0.0, info.duration_s * p) for p in _SAMPLE_POSITIONS]
+                     if info.duration_s > 0 else [0.0])
+        best = 0
+        with tempfile.TemporaryDirectory(prefix="facekeep_faces_") as td:
+            for i, t in enumerate(positions):
+                frame = Path(td) / f"frame_{i}.png"
+                cmd = [ffmpeg, "-y", "-hide_banner", "-nostdin",
+                       "-loglevel", "error"]
+                if t:
+                    cmd += ["-ss", f"{t:.3f}"]
+                cmd += ["-i", os.path.abspath(src), "-frames:v", "1",
+                        "-update", "1", str(frame)]
+                proc = subprocess.run(cmd, capture_output=True, text=True)
+                if proc.returncode != 0 or not frame.is_file():
+                    continue  # e.g. a seek past a short stream's end
+                img = cv2.imread(str(frame))
+                if img is None:
+                    continue
+                best = max(best, len(detector.detect(img)))
+        return best
+    except Exception as e:  # noqa: BLE001 - detection never fails the pipeline
+        logger.warning(
+            "%s: sampled face detection failed (%s); assuming no faces.",
+            src.name, e,
+        )
+        return 0
+
+
 def _encode_command(ffmpeg: str, src: Path, tmp: Path, *, crf: int, preset: int,
                     ten_bit: bool, start: Optional[float] = None,
                     duration: Optional[float] = None,
-                    sample: bool = False) -> List[str]:
+                    sample: bool = False, dolby_vision: bool = False) -> List[str]:
     """Build the SVT-AV1 re-encode command (the hardened 10.0 spike command).
 
     Deliberate policies, each a ROADMAP 10.0 finding:
@@ -638,7 +759,19 @@ def _encode_command(ffmpeg: str, src: Path, tmp: Path, *, crf: int, preset: int,
     solely to be VMAF-scored and thrown away: ``start``/``duration`` trim it
     (input seek — frame-accurate when transcoding), audio and metadata are
     dropped. All the video policies above stay identical, so the probe
-    measures exactly what the real encode would do.
+    measures exactly what the real encode would do. (Probes never pass
+    ``dolby_vision`` — the RPU is metadata the decoder ignores for pixels, so
+    it cannot move a VMAF score, and a DV-less probe can't fail on an exotic
+    RPU.)
+
+    ``dolby_vision=True`` (ROADMAP 10.5; only when the *source* carries an
+    RPU-bearing DOVI record — the flag hard-fails the encoder on a DV-less
+    input) adds ``-dolbyvision 1``: the wrapper re-codes the decoder-exported
+    per-frame RPU into AV1 T.35 metadata OBUs (DV profile 8.x -> 10.x, content
+    verified value-identical on both real phone clips) at ~400 bytes/frame.
+    ``-strict unofficial`` is required by the mp4 muxer for the DV-AV1
+    ``dvcC``/``dvvC`` box — DV-in-AV1 mp4 signaling is not yet an official
+    Dolby spec; without the box a player never engages its DV pipeline.
     """
     cmd = [ffmpeg, "-y", "-hide_banner", "-nostdin", "-loglevel", "error"]
     if start:
@@ -656,6 +789,8 @@ def _encode_command(ffmpeg: str, src: Path, tmp: Path, *, crf: int, preset: int,
         "-svtav1-params", "tune=0",
         "-pix_fmt", "yuv420p10le" if ten_bit else "yuv420p",
     ]
+    if dolby_vision:
+        cmd += ["-dolbyvision", "1", "-strict", "unofficial"]
     if not sample:
         cmd += ["-c:a", "copy"]
     cmd += ["-movflags", "+faststart+use_metadata_tags", "-f", "mp4", str(tmp)]
@@ -671,14 +806,18 @@ def compress_video(
     skip_efficient: bool = True,
     vmaf_target: Optional[float] = DEFAULT_VMAF_TARGET,
     auto_tune: bool = False,
+    preserve_dolby_vision: bool = True,
+    face_vmaf_target: Optional[float] = DEFAULT_FACE_VMAF_TARGET,
+    detector=None,
 ) -> VideoResult:
     """Faithfully re-encode a phone video to SVT-AV1 in a standard ``.mp4``.
 
-    The full path: probe -> skip-if-efficient -> [opt-in sampled CRF
-    auto-tune] -> encode (VFR-safe, HDR/VUI passthrough, metadata carried,
-    first audio copied) -> VMAF quality gate -> skip-if-larger. The encode
-    writes to a temp file and renames on success, so a failed or skipped run
-    never leaves a partial output.
+    The full path: probe -> skip-if-efficient -> [sampled face detection ->
+    raised target] -> [opt-in sampled CRF auto-tune] -> encode (VFR-safe,
+    HDR/VUI passthrough, DV RPU carried, metadata carried, first audio
+    copied) -> VMAF quality gate -> skip-if-larger. The encode writes to a
+    temp file and renames on success, so a failed or skipped run never
+    leaves a partial output.
 
     Quality verification (ROADMAP 10.2): every written encode is VMAF-scored
     against the source by default (order-paired frames; ``vmaf_4k`` at native
@@ -691,6 +830,22 @@ def compress_video(
     (:func:`find_crf`), replacing the fixed ``crf``; the gate then verifies
     the whole file. Both degrade gracefully to the plain fixed-CRF encode
     (warned, unverified) when this ffmpeg build lacks libvmaf.
+
+    Dolby Vision (ROADMAP 10.5): when the source carries an RPU-bearing DOVI
+    record and ``preserve_dolby_vision`` is on (default), the per-frame RPU
+    is carried into the AV1 output (profile 8.x -> 10.x; see
+    :func:`_encode_command`) so a DV display renders the same tone-refined
+    picture as the original. Degrades gracefully: a build without the
+    ``-dolbyvision`` option — or an exotic RPU the wrapper rejects — warns
+    and encodes the plain HDR base layer (the pre-10.5 output).
+
+    Face-aware quality (ROADMAP 10.5): when ``face_vmaf_target`` is set
+    (default) and VMAF is in play, the face detector runs on a few sampled
+    frames first; faces present raise the effective p1 target (gate *and*
+    auto-tune) to ``max(target, face_vmaf_target)`` — family clips are held
+    to a higher floor, face-less footage is untouched. ``detector`` accepts
+    any ``FaceDetector`` (the CLI passes the configured one); ``None`` uses
+    the default offline Haar. ``face_vmaf_target=None`` disables it.
 
     A skip writes nothing and returns ``skipped=True`` with the reason —
     keep-the-original semantics are the caller's job (CLI integration, 10.3).
@@ -726,10 +881,44 @@ def compress_video(
             src.name, "gate + auto-tune" if auto_tune else "gate", crf,
         )
 
+    # Dolby Vision carry (10.5): only ever attempted when the *source* has an
+    # RPU (the flag hard-fails the encoder on a DV-less input) and this build
+    # can code it; otherwise today's HLG/HDR10-base output, warned.
+    use_dv = False
+    if preserve_dolby_vision and info.dovi_profile is not None:
+        if _ffmpeg_supports_dovi_encode(ffmpeg):
+            use_dv = True
+        else:
+            logger.warning(
+                "%s: source carries Dolby Vision (profile %d) but this ffmpeg "
+                "build cannot carry the RPU (libsvtav1 without -dolbyvision); "
+                "encoding the HDR base layer only.",
+                src.name, info.dovi_profile,
+            )
+
+    # Face-aware target raise (10.5). Sampled detection runs only when a VMAF
+    # target can actually consume the answer (gate or auto-tune, with libvmaf
+    # present) — otherwise it would be pure cost.
+    faces: Optional[int] = None
+    gate_target = vmaf_target
+    tune_target = vmaf_target if vmaf_target is not None else DEFAULT_VMAF_TARGET
+    if face_vmaf_target is not None and have_vmaf:
+        faces = _sampled_face_count(ffmpeg, src, info, detector)
+        if faces:
+            raised = max(tune_target, face_vmaf_target)
+            if gate_target is not None:
+                gate_target = max(gate_target, face_vmaf_target)
+            if raised > tune_target:
+                logger.info(
+                    "%s: faces on sampled frames (max %d) - raising VMAF p1 "
+                    "target %.1f -> %.1f",
+                    src.name, faces, tune_target, raised,
+                )
+            tune_target = raised
+
     t0 = time.perf_counter()
     chosen_crf = crf
     if auto_tune and have_vmaf:
-        tune_target = vmaf_target if vmaf_target is not None else DEFAULT_VMAF_TARGET
         chosen_crf, sampled = find_crf(src, target=tune_target, preset=preset,
                                        info=info)
         logger.info(
@@ -751,22 +940,34 @@ def compress_video(
     try:
         while True:
             cmd = _encode_command(ffmpeg, src, tmp, crf=attempt_crf, preset=preset,
-                                  ten_bit=info.bit_depth > 8)
+                                  ten_bit=info.bit_depth > 8, dolby_vision=use_dv)
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
+                if use_dv:
+                    # Graceful degradation (10.5): an RPU the wrapper cannot
+                    # map (e.g. an exotic/dual-layer profile) fails encoder
+                    # init — retry once without DV rather than failing the
+                    # file. Doesn't consume a gate retry.
+                    logger.warning(
+                        "%s: Dolby Vision RPU carry failed (%s); re-encoding "
+                        "without it (HDR base layer kept).",
+                        src.name, proc.stderr.strip()[-300:],
+                    )
+                    use_dv = False
+                    continue
                 raise VideoError(
                     f"ffmpeg encode failed on {src.name}: {proc.stderr.strip()[-1000:]}"
                 )
-            if vmaf_target is None or not have_vmaf:
+            if gate_target is None or not have_vmaf:
                 break
             score = score_vmaf(tmp, src, reference_info=info)
-            if score.p1 >= vmaf_target:
+            if score.p1 >= gate_target:
                 break
             if retries >= _GATE_MAX_RETRIES or attempt_crf <= _GATE_MIN_CRF:
                 logger.warning(
                     "%s: VMAF p1=%.2f still below target %.1f at crf=%d; "
                     "keeping the best effort (mean=%.2f).",
-                    src.name, score.p1, vmaf_target, attempt_crf, score.mean,
+                    src.name, score.p1, gate_target, attempt_crf, score.mean,
                 )
                 break
             retries += 1
@@ -774,7 +975,7 @@ def compress_video(
             logger.info(
                 "%s: VMAF p1=%.2f below target %.1f at crf=%d; re-encoding at "
                 "crf=%d (retry %d/%d).",
-                src.name, score.p1, vmaf_target, attempt_crf, new_crf,
+                src.name, score.p1, gate_target, attempt_crf, new_crf,
                 retries, _GATE_MAX_RETRIES,
             )
             attempt_crf = new_crf
@@ -793,6 +994,7 @@ def compress_video(
                 input_path=src, output_path=None, original_size=original_size,
                 compressed_size=0, skipped=True, skip_reason=reason,
                 encode_seconds=encode_seconds, crf_used=attempt_crf, vmaf=score,
+                dolby_vision=use_dv, faces=faces,
             )
         os.replace(tmp, out)
     finally:
@@ -800,14 +1002,15 @@ def compress_video(
             tmp.unlink(missing_ok=True)
 
     logger.info(
-        "Compressed %s -> %s: %.1f MB -> %.1f MB (%.1fx) in %.0fs%s",
+        "Compressed %s -> %s: %.1f MB -> %.1f MB (%.1fx) in %.0fs%s%s",
         src.name, out.name, original_size / 1e6, compressed_size / 1e6,
         original_size / compressed_size, encode_seconds,
         "" if score is None else
         f" (crf={attempt_crf}, VMAF p1={score.p1:.2f} mean={score.mean:.2f})",
+        " [DV RPU carried]" if use_dv else "",
     )
     return VideoResult(
         input_path=src, output_path=out, original_size=original_size,
         compressed_size=compressed_size, encode_seconds=encode_seconds,
-        crf_used=attempt_crf, vmaf=score,
+        crf_used=attempt_crf, vmaf=score, dolby_vision=use_dv, faces=faces,
     )

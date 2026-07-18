@@ -11,7 +11,12 @@ from .exceptions import ConfigError
 # measured rationale); the dataclass below mirrors them so the YAML/CLI layer
 # and the library API can never drift apart. video.py imports only stdlib +
 # exceptions, so this adds no import cycle and no heavy dependency.
-from .video import DEFAULT_CRF, DEFAULT_PRESET, DEFAULT_VMAF_TARGET
+from .video import (
+    DEFAULT_CRF,
+    DEFAULT_FACE_VMAF_TARGET,
+    DEFAULT_PRESET,
+    DEFAULT_VMAF_TARGET,
+)
 
 
 @dataclass
@@ -477,6 +482,22 @@ class VideoConfig:
     # bits/pixel/frame) instead of burning hours adding a lossy generation for
     # nothing. Also what keeps our own outputs from being re-eaten on a re-run.
     skip_efficient: bool = True
+    # Carry a Dolby Vision source's per-frame RPU (tone-mapping refinement)
+    # into the AV1 output (DV profile 8.x -> 10.x) so a DV display renders the
+    # same picture as the original — phone HDR clips are routinely DV 8.4, and
+    # without the RPU they degrade to the plain HLG base (measured on a real
+    # phone: visibly less saturated). Needs an ffmpeg whose libsvtav1 has
+    # Dolby Vision support; an older build keeps the HLG base with a warning.
+    preserve_dolby_vision: bool = True
+    # Face-aware quality (the photo chroma/auto-tune analog): run the shared
+    # face detector on a few sampled frames and, when faces are present, raise
+    # the VMAF p1 target to face_vmaf_target — a clip's worst moments are held
+    # to a higher bar exactly when people are in it. A missed face keeps the
+    # base target (never worse than face-less); a false positive only costs
+    # bytes. Needs the gate/auto-tune (and libvmaf) to have any effect.
+    face_aware: bool = True
+    # The raised p1 target for face-bearing clips (never lowers vmaf_target).
+    face_vmaf_target: float = DEFAULT_FACE_VMAF_TARGET
 
 
 # ---------------------------------------------------------------------------
@@ -770,6 +791,16 @@ video:
   # Opt-in: probe short samples to find the highest CRF meeting vmaf_target
   # per clip (instead of the fixed crf above). Slower at compress time.
   auto_tune: {str(v.auto_tune).lower()}
+  # Carry a Dolby Vision source's per-frame tone-mapping metadata (RPU) into
+  # the AV1 output, so a DV display renders it like the original (phone HDR
+  # clips are routinely DV). Needs a recent ffmpeg; older builds keep the
+  # plain HDR base with a warning.
+  preserve_dolby_vision: {str(v.preserve_dolby_vision).lower()}
+  # Face-aware quality: detect faces on a few sampled frames and hold
+  # face-bearing clips to the higher face_vmaf_target (people are the
+  # subject). Face-less footage keeps vmaf_target.
+  face_aware: {str(v.face_aware).lower()}
+  face_vmaf_target: {v.face_vmaf_target}
 """
 
 
@@ -946,6 +977,11 @@ class FaceKeepConfig:
             raise ConfigError("video.crf must be 0-63 (SVT-AV1 CRF range)")
         if not 0 <= self.video.preset <= 13:
             raise ConfigError("video.preset must be 0-13 (SVT-AV1 preset range)")
+        if not 0 < self.video.face_vmaf_target <= 100:
+            raise ConfigError(
+                "video.face_vmaf_target must be between 0 (exclusive) and 100 "
+                "(VMAF score range)"
+            )
         if self.video.vmaf_target is not None and not (
             0 < self.video.vmaf_target <= 100
         ):

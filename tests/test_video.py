@@ -624,3 +624,297 @@ def test_auto_tune_real_end_to_end(src_cfr: Path, fixtures: Path):
     assert res.vmaf is not None  # the gate verified the full file
     # The gate may have stepped below the searched CRF, never above it.
     assert video._GATE_MIN_CRF <= res.crf_used <= crf
+
+
+# ---------------------------------------------------------------------------
+# Dolby Vision RPU carry (ROADMAP 10.5)
+# ---------------------------------------------------------------------------
+#
+# Synthetic fixtures cannot carry a real DV RPU (x264/x265 here don't write
+# one), so the wiring is pinned with stubs: a probed dovi_profile + a
+# capability-positive build must add the flags; every degradation path must
+# come back to today's plain encode. The real-clip end-to-end (both phones'
+# DV 8.4 clips, per-frame RPU parsed value-identical) is a session-run
+# verification per the repo convention — the clips are not in the repo.
+
+
+def test_encode_command_dolby_vision_flags(tmp_path):
+    """DV adds exactly -dolbyvision 1 + -strict unofficial; default is unchanged."""
+    plain = video._encode_command("ffmpeg", tmp_path / "a.mov",
+                                  tmp_path / "t.mp4", crf=32, preset=6,
+                                  ten_bit=True)
+    dv = video._encode_command("ffmpeg", tmp_path / "a.mov", tmp_path / "t.mp4",
+                               crf=32, preset=6, ten_bit=True,
+                               dolby_vision=True)
+    assert "-dolbyvision" not in plain and "-strict" not in plain
+    i = dv.index("-dolbyvision")
+    assert dv[i:i + 4] == ["-dolbyvision", "1", "-strict", "unofficial"]
+    # The four DV tokens are the ONLY difference — the plain command (what
+    # every DV-less source gets) is byte-identical to the pre-10.5 one.
+    assert dv[:i] + dv[i + 4:] == plain
+
+
+def test_probe_parses_dovi_profile(monkeypatch, tmp_path):
+    """An RPU-bearing DOVI record lands on VideoInfo.dovi_profile; an
+    RPU-less record (or none) stays None."""
+
+    def canned(side_data):
+        return json.dumps({
+            "format": {"size": "1000", "duration": "2.0"},
+            "streams": [{
+                "codec_type": "video", "codec_name": "hevc",
+                "width": 320, "height": 240, "pix_fmt": "yuv420p10le",
+                "avg_frame_rate": "30/1", "bit_rate": "20000000",
+                "side_data_list": side_data,
+            }],
+        })
+
+    def probe_with(side_data):
+        monkeypatch.setattr(video, "_find_ffprobe", lambda: "ffprobe")
+        monkeypatch.setattr(
+            video.subprocess, "run",
+            lambda cmd, **kw: subprocess.CompletedProcess(
+                cmd, 0, canned(side_data), ""),
+        )
+        return video.probe_video(tmp_path / "x.mov")
+
+    with_rpu = probe_with([{"side_data_type": "DOVI configuration record",
+                            "dv_profile": 8, "rpu_present_flag": 1,
+                            "dv_bl_signal_compatibility_id": 4}])
+    assert with_rpu.dovi_profile == 8
+
+    no_rpu = probe_with([{"side_data_type": "DOVI configuration record",
+                          "dv_profile": 8, "rpu_present_flag": 0}])
+    assert no_rpu.dovi_profile is None
+
+    assert probe_with([]).dovi_profile is None
+
+
+def test_dovi_encode_capability_probe(monkeypatch):
+    monkeypatch.setattr(video, "_dovi_encode_cache", {})
+
+    def fake_run(cmd, **kw):
+        out = ("  -dolbyvision       <boolean>    Enable Dolby Vision RPU "
+               "coding (default auto)" if "with_dv" in cmd[0] else
+               "  -crf   <int>  CRF")
+        return subprocess.CompletedProcess(cmd, 0, out, "")
+
+    monkeypatch.setattr(video.subprocess, "run", fake_run)
+    assert video._ffmpeg_supports_dovi_encode("with_dv/ffmpeg") is True
+    assert video._ffmpeg_supports_dovi_encode("old/ffmpeg") is False
+    # Cached: a second call must not re-probe.
+    monkeypatch.setattr(video.subprocess, "run",
+                        lambda *a, **k: pytest.fail("capability re-probed"))
+    assert video._ffmpeg_supports_dovi_encode("with_dv/ffmpeg") is True
+
+
+def _dv_source_info(src: Path, dovi_profile) -> video.VideoInfo:
+    """A phone-DV-shaped probe result (fat HEVC HLG; skip-if-efficient no)."""
+    return video.VideoInfo(
+        path=src, size_bytes=src.stat().st_size, duration_s=2.0,
+        width=320, height=240, fps=30.0, v_codec="hevc",
+        pix_fmt="yuv420p10le", bit_depth=10, v_bit_rate=20_000_000,
+        color_primaries="bt2020", color_transfer="arib-std-b67",
+        color_space="bt2020nc", rotation=0, a_codec=None,
+        dovi_profile=dovi_profile,
+    )
+
+
+@pytest.fixture()
+def dv_stub_env(monkeypatch, tmp_path):
+    """A fully stubbed compress_video environment for the DV wiring tests.
+
+    Returns (src, out, encode_cmds): the fake encode records each command and
+    writes a small (always-smaller) output. No ffmpeg binary is needed.
+    """
+    src = tmp_path / "in.mov"
+    src.write_bytes(b"\0" * 10_000)
+    out = tmp_path / "out.mp4"
+    monkeypatch.setattr(video, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(video, "_find_ffprobe", lambda: "ffprobe")
+    encode_cmds: list = []
+
+    def fake_run(cmd, **kw):
+        encode_cmds.append(cmd)
+        Path(cmd[-1]).write_bytes(b"\0" * 1000)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(video.subprocess, "run", fake_run)
+    return src, out, encode_cmds
+
+
+def test_dv_carried_when_source_and_build_support(dv_stub_env, monkeypatch):
+    src, out, cmds = dv_stub_env
+    monkeypatch.setattr(video, "probe_video",
+                        lambda p: _dv_source_info(src, 8))
+    monkeypatch.setattr(video, "_ffmpeg_supports_dovi_encode", lambda ff: True)
+    res = video.compress_video(src, out, vmaf_target=None)
+    assert not res.skipped
+    assert res.dolby_vision is True
+    assert "-dolbyvision" in cmds[-1]
+
+
+def test_dv_not_attempted_without_source_rpu(dv_stub_env, monkeypatch):
+    src, out, cmds = dv_stub_env
+    monkeypatch.setattr(video, "probe_video",
+                        lambda p: _dv_source_info(src, None))
+    monkeypatch.setattr(
+        video, "_ffmpeg_supports_dovi_encode",
+        lambda ff: pytest.fail("capability probed for a DV-less source"))
+    res = video.compress_video(src, out, vmaf_target=None)
+    assert res.dolby_vision is False
+    assert "-dolbyvision" not in cmds[-1]
+
+
+def test_dv_skipped_when_build_cannot(dv_stub_env, monkeypatch, caplog):
+    src, out, cmds = dv_stub_env
+    monkeypatch.setattr(video, "probe_video",
+                        lambda p: _dv_source_info(src, 8))
+    monkeypatch.setattr(video, "_ffmpeg_supports_dovi_encode", lambda ff: False)
+    with caplog.at_level(logging.WARNING, logger="facekeep.video"):
+        res = video.compress_video(src, out, vmaf_target=None)
+    assert res.dolby_vision is False
+    assert "-dolbyvision" not in cmds[-1]
+    assert any("cannot carry the RPU" in r.message for r in caplog.records)
+
+
+def test_dv_opt_out_config(dv_stub_env, monkeypatch):
+    src, out, cmds = dv_stub_env
+    monkeypatch.setattr(video, "probe_video",
+                        lambda p: _dv_source_info(src, 8))
+    monkeypatch.setattr(video, "_ffmpeg_supports_dovi_encode", lambda ff: True)
+    res = video.compress_video(src, out, vmaf_target=None,
+                               preserve_dolby_vision=False)
+    assert res.dolby_vision is False
+    assert "-dolbyvision" not in cmds[-1]
+
+
+def test_dv_encode_failure_falls_back_plain(monkeypatch, tmp_path, caplog):
+    """An RPU the wrapper rejects fails encoder init -> retried without DV
+    (same CRF, no gate retry consumed), warned — never a failed file."""
+    src = tmp_path / "in.mov"
+    src.write_bytes(b"\0" * 10_000)
+    out = tmp_path / "out.mp4"
+    monkeypatch.setattr(video, "find_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(video, "_find_ffprobe", lambda: "ffprobe")
+    monkeypatch.setattr(video, "probe_video",
+                        lambda p: _dv_source_info(src, 8))
+    monkeypatch.setattr(video, "_ffmpeg_supports_dovi_encode", lambda ff: True)
+    cmds: list = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        if "-dolbyvision" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "dovi mapping boom")
+        Path(cmd[-1]).write_bytes(b"\0" * 1000)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(video.subprocess, "run", fake_run)
+    with caplog.at_level(logging.WARNING, logger="facekeep.video"):
+        res = video.compress_video(src, out, vmaf_target=None)
+    assert not res.skipped
+    assert res.dolby_vision is False
+    assert res.output_path.exists()
+    assert len(cmds) == 2  # one DV attempt, one plain retry
+    assert any("RPU carry failed" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Face-aware quality (ROADMAP 10.5)
+# ---------------------------------------------------------------------------
+
+
+class _FakeDetector:
+    """Duck-typed FaceDetector: records the frames it saw, returns N boxes."""
+
+    def __init__(self, n_faces: int, fail: bool = False):
+        self.n_faces = n_faces
+        self.fail = fail
+        self.seen: list = []
+
+    def detect(self, image):
+        if self.fail:
+            raise RuntimeError("detector boom")
+        self.seen.append(image.shape)
+        return [object()] * self.n_faces
+
+
+@needs_ffmpeg
+def test_sampled_face_count_extracts_real_frames(src_cfr: Path):
+    det = _FakeDetector(2)
+    info = video.probe_video(src_cfr)
+    n = video._sampled_face_count(video.find_ffmpeg(), src_cfr, info, det)
+    assert n == 2
+    assert len(det.seen) >= 1  # real frames were decoded and handed over
+    assert all(shape == (240, 320, 3) for shape in det.seen)
+
+
+@needs_ffmpeg
+def test_sampled_face_count_detector_error_is_zero(src_cfr: Path, caplog):
+    info = video.probe_video(src_cfr)
+    with caplog.at_level(logging.WARNING, logger="facekeep.video"):
+        n = video._sampled_face_count(video.find_ffmpeg(), src_cfr, info,
+                                      _FakeDetector(3, fail=True))
+    assert n == 0  # detection never fails the pipeline
+
+
+@needs_ffmpeg
+def test_face_raise_triggers_gate_retry(src_cfr: Path, fixtures: Path,
+                                        monkeypatch):
+    """p1=94 passes the base 93 target but misses the face-raised 95 ->
+    exactly the face clips get the extra gate step."""
+    monkeypatch.setattr(video, "_ffmpeg_has_libvmaf", lambda ff: True)
+    monkeypatch.setattr(video, "_sampled_face_count", lambda *a, **k: 1)
+    scores = iter([_stub_score(94.0), _stub_score(96.0)])
+    monkeypatch.setattr(video, "score_vmaf", lambda *a, **k: next(scores))
+    res = video.compress_video(src_cfr, fixtures / "out_face_retry.mp4",
+                               crf=40, preset=10, vmaf_target=93.0,
+                               face_vmaf_target=95.0)
+    assert res.faces == 1
+    assert res.crf_used == 40 - video._GATE_CRF_STEP  # the raise bit
+
+    # Same score, no faces -> the base target accepts the first pass.
+    monkeypatch.setattr(video, "_sampled_face_count", lambda *a, **k: 0)
+    monkeypatch.setattr(video, "score_vmaf", lambda *a, **k: _stub_score(94.0))
+    res2 = video.compress_video(src_cfr, fixtures / "out_noface.mp4",
+                                crf=40, preset=10, vmaf_target=93.0,
+                                face_vmaf_target=95.0)
+    assert res2.faces == 0
+    assert res2.crf_used == 40
+
+
+@needs_ffmpeg
+def test_face_sampling_only_runs_when_a_target_can_use_it(
+        src_cfr: Path, fixtures: Path, monkeypatch):
+    monkeypatch.setattr(
+        video, "_sampled_face_count",
+        lambda *a, **k: pytest.fail("face sampling ran for nothing"))
+    # face_vmaf_target=None (config face_aware off) -> never sampled.
+    monkeypatch.setattr(video, "_ffmpeg_has_libvmaf", lambda ff: True)
+    monkeypatch.setattr(video, "score_vmaf", lambda *a, **k: _stub_score(99.0))
+    video.compress_video(src_cfr, fixtures / "out_fa_off.mp4", crf=40,
+                         preset=10, vmaf_target=93.0, face_vmaf_target=None)
+    # Gate + auto-tune both off -> no consumer for the answer -> never sampled.
+    video.compress_video(src_cfr, fixtures / "out_fa_nogate.mp4", crf=40,
+                         preset=10, vmaf_target=None)
+
+
+@needs_ffmpeg
+def test_auto_tune_gets_face_raised_target(src_cfr: Path, fixtures: Path,
+                                           monkeypatch):
+    monkeypatch.setattr(video, "_ffmpeg_has_libvmaf", lambda ff: True)
+    monkeypatch.setattr(video, "_sampled_face_count", lambda *a, **k: 2)
+    monkeypatch.setattr(video, "score_vmaf", lambda *a, **k: _stub_score(96.0))
+    seen_targets: list = []
+
+    def fake_find_crf(src, *, target, preset, info=None):
+        seen_targets.append(target)
+        return 38, _stub_score(96.0)
+
+    monkeypatch.setattr(video, "find_crf", fake_find_crf)
+    res = video.compress_video(src_cfr, fixtures / "out_tune_face.mp4",
+                               preset=10, auto_tune=True, vmaf_target=93.0,
+                               face_vmaf_target=95.0)
+    assert seen_targets == [95.0]  # the search held the raised bar
+    assert res.crf_used == 38
+    assert res.faces == 2

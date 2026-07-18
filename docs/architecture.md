@@ -592,8 +592,9 @@ bits/pixel/frame — re-encoding an efficient file burns hours to add a lossy
 generation, and it keeps FaceKeep's own outputs from being re-eaten) → SVT-AV1
 encode with `-fps_mode passthrough` (phones record **VFR**; a CFR re-time
 accumulates A/V desync — the measured shipped-bug-grade gotcha), 10-bit + HLG
-VUI passthrough (HDR stays HDR; a Dolby Vision RPU degrades to its HLG base
-layer), first video + first audio track copied bit-exact, container metadata
+VUI passthrough (HDR stays HDR; a Dolby Vision RPU is *carried* too by
+default — see the 10.5 paragraph below), first video + first audio track
+copied bit-exact, container metadata
 (creation time, GPS) mapped through → **VMAF quality gate** (default on): the
 encode is scored against the source with order-paired frames (`vmaf_4k` at
 native resolution for 4K-class sources; the pooled **p1** — the worst-1%-frame
@@ -622,6 +623,52 @@ the videos already completed in the same run (the first says "measuring"
 rather than guessing). A dry run probes and reports the decision but never
 test-encodes a video, so `--dry-run` stays cheap and honest (no invented size
 estimate).
+
+**Dolby Vision survives the re-encode (10.5, `video.preserve_dolby_vision`,
+on by default).** Both real phones record HDR video as Dolby Vision profile
+8.4: a genuine HLG base layer any HDR display can show, plus a per-frame
+**RPU** — Dolby's tone-mapping refinement metadata. The base layer always
+survived our re-encode (10-bit + VUI passthrough), but the RPU did not, and
+the 10.4 device test made that loss *visible*: on a DV phone screen the
+original renders through the Dolby pipeline (per-scene tone/saturation
+refinement) while the plain-HLG re-encode does not — same stored chroma,
+different render. The fix needs **no external tool** (the ROADMAP's
+anticipated `dovi_tool` turned out unnecessary): modern ffmpeg's libsvtav1
+wrapper re-codes the decoder-exported RPU into AV1 T.35 metadata OBUs
+(`-dolbyvision 1`; DV profile 8.x → 10.x with the same base-compatibility
+id), and the mp4 muxer writes the DV-AV1 `dvcC` signaling box under
+`-strict unofficial` (that box is not yet an official Dolby spec — the flag
+is scoped to DV encodes only). Verified on both real clips: every output
+frame carries a parsed RPU field-identical to its source frame (60/60 CFR,
+91/91 VFR), at ~405 bytes/frame (<1.5%). Graceful degradation in three
+layers: the flag is only attempted when the *probe* saw an RPU-bearing DOVI
+record (it hard-fails the encoder on a DV-less input); a build whose
+libsvtav1 lacks the option encodes today's HLG-base output with a warning;
+and if the DV encode itself fails (an exotic profile the wrapper can't map)
+it retries once without DV — a file never fails because of Dolby Vision. SDR
+and DV-less HDR sources produce token-identical commands to before, and
+players without DV support simply ignore the metadata and show the HLG base
+(the same backward-compatible bargain as the original phone file).
+
+**Face-aware quality (10.5, `video.face_aware`, on by default)** is the photo
+chroma/auto-tune analog: people are what a family clip is *about*, so their
+worst moments deserve a higher floor. The shared `detector:` config's face
+detector (Haar by default — offline, zero-download; the CLI builds it once in
+the parent, the serial-path discipline) runs on three frames sampled at the
+auto-tune positions; if any face appears, the VMAF p1 target for both the
+quality gate and the auto-tune search rises to `video.face_vmaf_target`
+(default 95, measured: the default CRF 32 lands p1 94.5–95.4 on the real
+clips, so a borderline face clip gets exactly one gate step of extra quality
+— CRF −4 — while an already-good one stays single-pass). The decision is
+per-clip and quality-only: a face the sampling misses keeps the base target
+(never worse than before), a false positive only spends bytes, and detection
+failure counts as zero faces (detection never fails a pipeline — the photo
+rule). Sampling runs only when a target can consume the answer (gate or
+auto-tune active with libvmaf present). Because the detection outcome now
+affects video output, the detector fields that change *whether* a face is
+found feed the video fingerprint when `face_aware` is on; box-shaping fields
+(padding/ROI) and — with it off — the whole detector never bust cached
+encodes.
 
 ## Components
 
@@ -740,7 +787,13 @@ estimate).
 - **video.py** — the faithful video pipeline (see "Faithful video" above):
   `probe_video`/`compress_video`/`score_vmaf`/`find_crf`, the
   `VIDEO_EXTENSIONS` set the CLI gathers by, and the `$FACEKEEP_FFMPEG` → PATH
-  binary gating (`find_ffmpeg`/`ffmpeg_available`/`vmaf_available`). Photos
+  binary gating (`find_ffmpeg`/`ffmpeg_available`/`vmaf_available`). 10.5 adds
+  the Dolby Vision RPU carry (probe-detected DOVI record + a cached
+  `-dolbyvision` capability check on the build; failure at any layer degrades
+  to the plain HLG-base encode, warned) and face-aware quality
+  (`_sampled_face_count` on three sampled frames with the shared detector —
+  the CLI threads the configured instance in — raising the gate/auto-tune p1
+  target for face-bearing clips). Photos
   never import it at pipeline time; `config.py` imports only its default
   constants so the `video:` section can't drift from the library defaults.
 - **aggressive/** — `compressor`, `blender`, `format`, `restorer`.
