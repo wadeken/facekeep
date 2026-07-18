@@ -670,6 +670,63 @@ found feed the video fingerprint when `face_aware` is on; box-shaping fields
 (padding/ROI) and — with it off — the whole detector never bust cached
 encodes.
 
+## Effortless backup: watch mode (Phase 11)
+
+Phases 1–10 built the *pipeline*; Phase 11 builds the *workflow*: photos and
+videos that reach the computer get compressed into an archive automatically.
+The core (11.1) is `facekeep watch <inbox> -o <archive>` — a long-running
+polling loop over the exact folder machinery `compress` uses (the whole
+`compress` body was extracted into `cli._run_batch`, so a watch cycle produces
+byte-identical outputs and identical per-file lines): scan → compress
+new/changed files → sleep → repeat, with `--once` for a single pass so Task
+Scheduler / cron / launchd can own the schedule. Polling (not
+filesystem-event APIs) is deliberate: cross-platform, zero new dependencies,
+robust against dropped events — and made cheap by the design below. It rides
+*any* phone → computer transport (iCloud for Windows, OneDrive/Google Drive
+camera upload, Syncthing, an import folder); direct device plumbing is
+deliberately last (11.4).
+
+Three loop-level guarantees make polling honest and cheap:
+
+- **Idle cycles touch metadata only.** The incremental index's skip test is a
+  full SHA-256 read — the wrong cost for a poll loop over a big video
+  library. So index rows also record the input's size+mtime (captured
+  stat-before-hash, the safe direction), and the watch loop's pre-filter
+  (`ProcessIndex.is_unchanged_stat`) skips an unchanged file from metadata
+  alone; only misses proceed to the batch, which hashes honestly. The quick
+  check is **watch-only**: `compress` keeps the documented full-hash test.
+  The new columns arrived by additive in-place migration — never a
+  table-wiping version bump, because a wiped video row costs a
+  minutes-to-hours re-encode.
+- **A mid-sync file is never half-read.** A file is eligible only after its
+  (size, mtime) is identical across two consecutive scans — this covers both
+  temp+rename and write-in-place sync clients. The first pass bootstraps with
+  a paired, `--settle`-delayed double scan so a quiet inbox is processed
+  immediately (and `--once` has stability too). Failed/skipped files are
+  memoized by stat and retried only when the file changes, so a corrupt
+  photo doesn't burn CPU every cycle.
+- **Product guardrails.** Sources are never deleted or modified (cleanup is
+  the user's); archive == inbox is refused; and the startup line states the
+  honesty note — faithful is visually lossless, *not* bit-exact, with
+  `--lossless` the archival answer when the archive is the only copy
+  (aggressive mode's reconstructed backgrounds get their own note, and its
+  video exclusion is announced once, not per cycle).
+
+**Live Photos (guardrail 3, measured then decided).** A Live Photo is a
+HEIC/JPG still plus a ~3 s `.mov`, linked by Apple identifiers. Measured on
+our own encode command: the container-level pairing key
+(`com.apple.quicktime.content.identifier`) *survives* the re-encode, but the
+`still-image-time` marker lives in a mebx timed-metadata **track**, which the
+first-video+first-audio mapping drops structurally — so a re-encoded motion
+side is no longer a Live Photo to anything, while re-encoding it saves only a
+couple of MB. Decided policy (`video.preserve_live_photos`, default on): a
+`.mov` with a same-stem HEIC/JPG sibling on disk *and* the probed pairing key
+is **kept verbatim** (the kept-original path, index-recorded); the still
+compresses normally — its EXIF MakerNote asset identifier rides verbatim.
+The honest documented loss: Apple-Photos re-import as a *live* photo requires
+the original HEIC/JPEG still, which no compressed archive has, whatever the
+policy.
+
 ## Components
 
 - **config.py** — `FaceKeepConfig` (dataclasses) with `validate()`, YAML
@@ -783,7 +840,11 @@ encodes.
   unchanged photos whose output still exists. Opened only in the parent process
   (the CLI), so it never contends with `--jobs` workers. (The per-image detection
   cache that complements it lives in `detector.py` — see above; both are
-  parent-process-only and share the detector-field set that busts them.)
+  parent-process-only and share the detector-field set that busts them.) Rows
+  also carry the input's size+mtime (11.1, additive in-place migration — never
+  a table-wiping version bump) so the watch loop's `is_unchanged_stat` can
+  skip an unchanged file from metadata alone; `compress` itself still uses the
+  full-hash check.
 - **video.py** — the faithful video pipeline (see "Faithful video" above):
   `probe_video`/`compress_video`/`score_vmaf`/`find_crf`, the
   `VIDEO_EXTENSIONS` set the CLI gathers by, and the `$FACEKEEP_FFMPEG` → PATH
@@ -797,12 +858,16 @@ encodes.
   never import it at pipeline time; `config.py` imports only its default
   constants so the `video:` section can't drift from the library defaults.
 - **aggressive/** — `compressor`, `blender`, `format`, `restorer`.
-- **cli.py** — Click CLI: `compress`, `restore`, `info`, `quality`, `compare`,
-  `verify`, `bench`, `init`, `gui`. `compress` routes each gathered file by
-  kind: photos through `_process_one` (serial or the `--jobs` pool), videos
-  through `_process_one_video` (always serial in the parent, with the stderr
-  ETA line); the two share the replay/summary/report machinery so a mixed
-  folder prints one coherent ledger.
+- **cli.py** — Click CLI: `compress`, `watch`, `restore`, `info`, `quality`,
+  `compare`, `verify`, `bench`, `init`, `gui`. The folder machinery lives in
+  `_run_batch` (the extracted `compress` body: returns `(exit_code, summary)`,
+  accepts `only_files=`): it routes each gathered file by kind — photos
+  through `_process_one` (serial or the `--jobs` pool), videos through
+  `_process_one_video` (always serial in the parent, with the stderr ETA
+  line) — and the two share the replay/summary/report machinery so a mixed
+  folder prints one coherent ledger. `compress` is a thin wrapper over it;
+  `watch` (11.1) is the polling loop around it (stability guard + stat
+  pre-filter + per-cycle summary; see "Effortless backup" above).
 - **compare.py** — `facekeep compare`: a read-only before/after viewer. Loads an
   original and a compressed artifact, reconstructs the "after" (faithful decode /
   `.fkeep` restore or `--preview` bicubic / a standard image), and writes a single

@@ -112,6 +112,7 @@ def test_video_config_defaults_mirror_video_module():
     assert cfg.video.preserve_dolby_vision is True
     assert cfg.video.face_aware is True
     assert cfg.video.face_vmaf_target == video.DEFAULT_FACE_VMAF_TARGET
+    assert cfg.video.preserve_live_photos is True
 
 
 def test_video_config_yaml_load_records_explicit_keys(tmp_path):
@@ -157,7 +158,8 @@ def test_video_fingerprint_busts_on_every_video_knob():
     for field, value in [("crf", 40), ("preset", 4), ("vmaf_target", None),
                          ("auto_tune", True), ("skip_efficient", False),
                          ("preserve_dolby_vision", False),
-                         ("face_aware", False), ("face_vmaf_target", 97.0)]:
+                         ("face_aware", False), ("face_vmaf_target", 97.0),
+                         ("preserve_live_photos", False)]:
         cfg = FaceKeepConfig()
         setattr(cfg.video, field, value)
         assert index_mod.video_settings_fingerprint(cfg) != fp0, field

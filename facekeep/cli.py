@@ -15,6 +15,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -73,6 +74,47 @@ def _setup_logging(verbose: bool):
         level=logging.DEBUG if verbose else logging.WARNING,
         format="%(levelname)s %(name)s: %(message)s",
     )
+
+
+# Live-Photo pair policy (ROADMAP 11.1). A Live Photo is a HEIC/JPG still plus
+# a ~3 s .mov, linked by Apple's content-identifier metadata. Measured on this
+# repo's own encode command: the container-level pairing key
+# (com.apple.quicktime.content.identifier, an mdta tag) DOES survive the
+# re-encode (-map_metadata 0 + use_metadata_tags), but the still-image-time
+# marker lives in a mebx timed-metadata TRACK, which `-map 0:v:0 -map 0:a:0?`
+# drops structurally — so a re-encoded motion side is no longer recognizable
+# as a Live Photo by anything, regardless of tags. The decided default policy
+# (video.preserve_live_photos): keep the pair's .mov VERBATIM (kept-original
+# semantics — it is tiny, so the size cost is negligible) and compress the
+# still normally (its EXIF, including the MakerNote asset identifier, rides
+# into the output untouched). The pair stays fully reconstructable; what is
+# honestly lost either way is Apple-Photos re-import as a *live* photo, which
+# requires the original HEIC/JPEG still.
+_LIVE_PHOTO_STILL_EXTS = (".heic", ".heif", ".jpg", ".jpeg")
+
+_LIVE_PAIR_REASON = (
+    "Live Photo pair - motion side kept verbatim (a re-encode would drop the "
+    "still-image-time track and un-pair it)"
+)
+
+
+def _live_photo_sibling(video_path: Path) -> "Path | None":
+    """The same-stem photo sibling that makes a ``.mov`` a Live-Photo candidate.
+
+    Apple names both sides identically (``IMG_1234.HEIC`` + ``IMG_1234.MOV``)
+    and every folder transport (iCloud for Windows, camera-upload clients, USB
+    import) preserves the names. Checked on DISK, not against the current
+    batch — in watch mode the two sides can arrive in different cycles. Both
+    extension casings are tried for case-sensitive filesystems. A false
+    positive only costs bytes (a video kept verbatim), never output
+    corruption; the probe-time pairing-key check filters coincidences anyway.
+    """
+    for ext in _LIVE_PHOTO_STILL_EXTS:
+        for cand in (video_path.with_name(video_path.stem + ext),
+                     video_path.with_name(video_path.stem + ext.upper())):
+            if cand.is_file():
+                return cand
+    return None
 
 
 def _gather(path: Path, exts: set[str]) -> list[Path]:
@@ -375,7 +417,8 @@ def _keep_original_video(src: Path, target: Path) -> Path:
 
 def _process_one_video(file_str: str, target: str, video_config,
                        dry_run: bool, detector=None,
-                       face_aware_ok: bool = True) -> dict:
+                       face_aware_ok: bool = True,
+                       live_pair: bool = False) -> dict:
     """Compress a single video and return a result dict (parent-process only).
 
     The video sibling of :func:`_process_one`. It always runs serially in the
@@ -404,14 +447,27 @@ def _process_one_video(file_str: str, target: str, video_config,
     could not construct the *configured* detector, and a custom backend is
     never silently swapped for Haar (the plugin rule), so the honest fallback
     is the base target.
+
+    ``live_pair=True`` marks a video with a same-stem photo sibling on disk
+    (the caller's cheap Live-Photo pre-filter). With
+    ``video_config.preserve_live_photos`` on, the probe then confirms the
+    Apple pairing key (``com.apple.quicktime.content.identifier``) and a
+    confirmed pair's motion side is **kept verbatim** (kept-original
+    semantics, reason ``_LIVE_PAIR_REASON``) instead of re-encoded — see the
+    policy note at ``_LIVE_PHOTO_STILL_EXTS``. A same-stem coincidence
+    without the key encodes normally.
     """
     f = Path(file_str)
     result: dict = {"file": f.name, "mode": "video"}
+    check_live = live_pair and video_config.preserve_live_photos
     try:
         if dry_run:
             info = video_mod.probe_video(f)
-            reason = (video_mod._efficiency_skip_reason(info)
-                      if video_config.skip_efficient else None)
+            reason = None
+            if check_live and info.content_identifier:
+                reason = _LIVE_PAIR_REASON
+            elif video_config.skip_efficient:
+                reason = video_mod._efficiency_skip_reason(info)
             size = info.size_bytes or f.stat().st_size
             if reason is not None:
                 result.update(
@@ -424,6 +480,16 @@ def _process_one_video(file_str: str, target: str, video_config,
                     status="would-encode", original_size=size,
                     quality=video_config.crf, output_name=Path(target).name,
                 )
+        elif check_live and video_mod.probe_video(f).content_identifier:
+            # Confirmed Live-Photo pair: keep the motion side byte-identical
+            # (copied into a differing output dir, like every kept-original).
+            size = f.stat().st_size
+            kept = _keep_original_video(f, Path(target))
+            result.update(
+                status="kept-original", reason=_LIVE_PAIR_REASON,
+                original_size=size, compressed_size=size, ratio=1.0,
+                quality=None, output_name=kept.name, output_path=str(kept),
+            )
         else:
             face_target = (
                 video_config.face_vmaf_target
@@ -742,12 +808,56 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
         click.echo(f"Config error: {e}", err=True)
         sys.exit(2)
 
+    code, _summary = _run_batch(
+        input_path, output_path, config, dry_run=dry_run,
+        report_path=report_path, jobs=jobs, no_videos=no_videos,
+        no_progress=no_progress, force=force, index_path=index_path,
+        no_index=no_index, no_detect_cache=no_detect_cache,
+    )
+    if code:
+        sys.exit(code)
+
+
+def _run_batch(input_path, output_path, config, *, dry_run=False,
+               report_path=None, jobs=1, no_videos=False, no_progress=False,
+               force=False, index_path=None, no_index=False,
+               no_detect_cache=False, only_files=None):
+    """The shared folder/file compress machinery (photos + videos), extracted.
+
+    This is the body ``compress`` always ran — gather, index skip, the photo
+    pool, serial videos with ETA lines, index record, ordered replay/summary/
+    report — as a reusable function so ``facekeep watch`` (11.1) can run the
+    exact same pipeline per cycle. Behavior contract: byte-identical outputs
+    and identical terminal output to the pre-extraction ``compress``.
+
+    Returns ``(exit_code, summary)``. ``exit_code`` 0 = the batch ran (some
+    files may still have failed individually); 1 = nothing to process (message
+    already echoed); 2 = a usage error (message already echoed). ``summary``
+    (empty on non-zero codes) carries the per-run counts the watch loop
+    aggregates: ``files``/``ok``/``unchanged``/``failed``/``skipped``,
+    ``total_in``/``total_out`` (bytes), and ``statuses`` (Path -> status).
+
+    ``only_files`` restricts the run to an explicit file list instead of
+    gathering from ``input_path`` (the watch loop passes the stability-checked,
+    stat-prefiltered set); ``None`` gathers as before.
+    """
     in_p = Path(input_path)
     include_videos = config.video.enabled and not no_videos
-    photo_files = _gather(in_p, IMAGE_EXTS)
-    video_files = _gather(in_p, video_mod.VIDEO_EXTENSIONS) if include_videos else []
+    if only_files is not None:
+        all_videos = [f for f in only_files
+                      if f.suffix.lower() in video_mod.VIDEO_EXTENSIONS]
+        photo_files = sorted(f for f in only_files
+                             if f.suffix.lower() in IMAGE_EXTS)
+        video_files = sorted(all_videos) if include_videos else []
+        excluded_videos_exist = bool(all_videos) and not include_videos
+    else:
+        photo_files = _gather(in_p, IMAGE_EXTS)
+        video_files = _gather(in_p, video_mod.VIDEO_EXTENSIONS) if include_videos else []
+        excluded_videos_exist = (
+            not include_videos and bool(_gather(in_p, video_mod.VIDEO_EXTENSIONS))
+        )
     if not photo_files and not video_files:
-        if not include_videos and _gather(in_p, video_mod.VIDEO_EXTENSIONS):
+        if excluded_videos_exist:
             click.echo(
                 f"Only video files found in: {input_path} - but videos are "
                 "excluded (--no-videos / video.enabled: false).",
@@ -757,7 +867,7 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
             click.echo(
                 f"No supported images or videos found in: {input_path}", err=True
             )
-        sys.exit(1)
+        return 1, {}
 
     # A video is *never* processed by aggressive mode (ROADMAP Phase 10:
     # per-frame AI restore is computationally absurd and temporally unstable —
@@ -773,7 +883,7 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                 "compress this video.",
                 err=True,
             )
-            sys.exit(2)
+            return 2, {}
         video_skip_reason = (
             "aggressive mode does not apply to video - re-run without "
             "-m aggressive/--preset to compress videos (faithful)"
@@ -784,7 +894,7 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     elif video_files and not video_mod.ffmpeg_available():
         if not photo_files and in_p.is_file():
             click.echo(video_mod._MISSING_FFMPEG_HINT, err=True)
-            sys.exit(2)
+            return 2, {}
         video_skip_reason = video_mod._MISSING_FFMPEG_HINT
 
     video_set = set(video_files)
@@ -857,8 +967,12 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
         return video_fingerprint if f in video_set else fingerprint
 
     # SHA-256 of each input, computed once and reused for both the skip lookup
-    # and the post-run record (so we never hash a file twice).
+    # and the post-run record (so we never hash a file twice). The stat pair
+    # (size, mtime_ns) is captured at the same moment — stat *before* hash, so
+    # a file changing mid-read leaves a stale stat that the watch pre-filter
+    # will miss on (the safe direction: re-check, never wrongly skip).
     hashes: dict = {}
+    stat_map: dict = {}  # f -> (size, mtime_ns) captured at hash time
     skipped_unchanged: dict = {}  # f -> result dict for a cache hit
     candidates = [f for f in files if f not in video_precluded]
     to_process = list(candidates)
@@ -868,6 +982,8 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                 remaining = []
                 for f in candidates:
                     try:
+                        st = f.stat()
+                        stat_map[f] = (st.st_size, st.st_mtime_ns)
                         h = index_mod.hash_file(f)
                     except OSError:
                         remaining.append(f)  # unreadable now: let the pipeline report it
@@ -875,6 +991,11 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                     hashes[f] = h
                     hit = idx.is_unchanged(f, h, _fingerprint_for(f))
                     if hit is not None:
+                        # Hash hit with a stale/absent recorded stat (a sync
+                        # client re-wrote identical bytes, or a pre-11.1 row):
+                        # refresh so the next watch cycle stat-hits hash-free.
+                        if (hit.input_size, hit.input_mtime_ns) != stat_map[f]:
+                            idx.update_stat(f, *stat_map[f])
                         skipped_unchanged[f] = {
                             "file": f.name, "mode": hit.mode,
                             "status": "skipped-unchanged",
@@ -1041,6 +1162,17 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     # gate) measured on the videos already completed *this run* — the honest
     # per-machine number the ROADMAP asked for. The first video has nothing
     # measured yet and says so instead of guessing.
+    # Live-Photo pair pre-filter (11.1): a .mov with a same-stem photo sibling
+    # on disk is a pair *candidate*; _process_one_video confirms the Apple
+    # pairing key at probe time and keeps a confirmed pair's motion side
+    # verbatim (see the policy note at _LIVE_PHOTO_STILL_EXTS).
+    live_pair_videos: set = set()
+    if config.video.preserve_live_photos:
+        live_pair_videos = {
+            f for f in to_process_videos
+            if f.suffix.lower() == ".mov" and _live_photo_sibling(f) is not None
+        }
+
     done_pixels = 0.0
     done_seconds = 0.0
     for i, f in enumerate(to_process_videos, 1):
@@ -1054,6 +1186,8 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
             will_encode = vinfo is not None and (
                 not config.video.skip_efficient
                 or video_mod._efficiency_skip_reason(vinfo) is None
+            ) and not (
+                f in live_pair_videos and vinfo.content_identifier
             )
             if will_encode:
                 pixels = (vinfo.width * vinfo.height
@@ -1071,7 +1205,8 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                 )
         res = _process_one_video(str(f), targets[f], config.video, dry_run,
                                  detector=video_detector,
-                                 face_aware_ok=video_face_aware_ok)
+                                 face_aware_ok=video_face_aware_ok,
+                                 live_pair=f in live_pair_videos)
         results[f] = res
         secs = res.get("encode_seconds") or 0.0
         if res["status"] == "ok" and pixels and secs > 0:
@@ -1091,7 +1226,18 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                     if res["status"] not in ("ok", "skipped-larger",
                                              "kept-original"):
                         continue
-                    h = hashes.get(f) or index_mod.hash_file(f)
+                    h = hashes.get(f)
+                    stat_pair = stat_map.get(f)
+                    if h is None:
+                        # Not hashed up front (--force / --no-index read path):
+                        # capture stat at this same moment so the pair stays
+                        # consistent with the hash (stat first — see above).
+                        try:
+                            st = f.stat()
+                            stat_pair = (st.st_size, st.st_mtime_ns)
+                        except OSError:
+                            stat_pair = None
+                        h = index_mod.hash_file(f)
                     # The path that must still exist for a future skip. Video
                     # results carry the exact artifact path (output, or the
                     # kept original); photo writers appended the codec/.fkeep
@@ -1114,6 +1260,8 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
                         # cwd-independent.
                         output_path=str(target_out.resolve()),
                         output_size=res["compressed_size"],
+                        input_size=stat_pair[0] if stat_pair else None,
+                        input_mtime_ns=stat_pair[1] if stat_pair else None,
                     ))
         except (sqlite3.Error, OSError) as e:  # recording is best-effort
             logging.getLogger("facekeep.cli").warning(
@@ -1124,6 +1272,8 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     total_in = total_out = 0
     ok = 0
     unchanged = 0  # cache hits (skipped-unchanged) — counted, not re-encoded
+    failed = 0
+    skipped = 0
     rows = []  # per-file ReportRow ledger (only materialized when --report given)
     for f in files:
         res = results[f]
@@ -1140,6 +1290,10 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
             ok += 1  # decided, but nothing measured — no size to total
         elif res["status"] == "skipped-unchanged":
             unchanged += 1
+        elif res["status"] in ("failed", "failed-unexpected"):
+            failed += 1
+        elif res["status"] == "skipped":
+            skipped += 1
         if report_path:
             rows.append(_row_from_result(res, dry_run))
 
@@ -1162,6 +1316,280 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
     if report_path:
         out = report.write_report(rows, report_path)
         click.echo(f"Report written -> {out} ({len(rows)} row(s))")
+
+    return 0, {
+        "files": len(files),
+        "ok": ok,
+        "unchanged": unchanged,
+        "failed": failed,
+        "skipped": skipped,
+        "total_in": total_in,
+        "total_out": total_out,
+        "statuses": {f: results[f]["status"] for f in files},
+    }
+
+
+def _scan_stats(root: Path, exts: set) -> dict:
+    """One watch scan: path -> (size, mtime_ns) for the folder's media files.
+
+    Metadata only — no file is opened or hashed, which is what keeps an idle
+    watch cycle cheap on a big library. A file vanishing mid-scan (sync-client
+    temp churn) is simply dropped from this cycle's snapshot.
+    """
+    out = {}
+    for f in _gather(root, exts):
+        try:
+            st = f.stat()
+        except OSError:
+            continue
+        out[f] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+@cli.command()
+@click.argument("inbox", type=click.Path(exists=True, file_okay=False))
+@click.option("-o", "--output", "output_path", type=click.Path(file_okay=False),
+              required=True,
+              help="Archive directory the compressed copies land in (created "
+                   "if missing; must differ from INBOX).")
+@click.option("--interval", type=float, default=60.0, show_default=True,
+              help="Seconds to sleep between scans. An idle scan touches file "
+                   "metadata only (no hashing), so a short interval stays cheap "
+                   "even on a big library.")
+@click.option("--once", is_flag=True,
+              help="Run a single pass and exit, so Task Scheduler / cron / "
+                   "launchd can own the schedule without a resident process. "
+                   "Exit code 1 if any file failed, else 0.")
+@click.option("--settle", type=float, default=2.0, show_default=True,
+              help="Seconds between the first pass's paired stability scans. A "
+                   "file is processed only after its size+mtime hold still "
+                   "across two consecutive scans, so a mid-sync/mid-copy file "
+                   "is never half-read.")
+@click.option("-m", "--mode", type=click.Choice(["faithful", "aggressive"]),
+              default=None,
+              help="faithful (default) = standard real-pixel .avif/.jxl; "
+                   "aggressive = .fkeep (videos are then skipped - video is "
+                   "faithful-only).")
+@click.option("--preset", type=click.Choice(list(PRESET_NAMES)), default=None,
+              help="Aggressive-mode preset (implies -m aggressive), as in "
+                   "`compress`.")
+@click.option("--codec", type=click.Choice(["avif", "jxl", "webp", "both"]),
+              default=None, help="Faithful-mode codec (default: avif).")
+@click.option("-q", "--quality", type=int, default=None,
+              help="Faithful-mode quality 0-100 (disables auto-tune, as in "
+                   "`compress`).")
+@click.option("--lossless/--lossy", "lossless", default=None,
+              help="Faithful mode: bit-exact archival encode. Use this when "
+                   "the archive will be your ONLY copy of irreplaceable "
+                   "originals - the default is visually lossless, not "
+                   "bit-exact.")
+@click.option("--strip-gps/--keep-gps", "strip_gps", default=None,
+              help="Strip the GPS EXIF from outputs (as in `compress`).")
+@click.option("--config", "config_path", type=click.Path(), default=None,
+              help="Path to a config YAML file (facekeep.yaml is "
+                   "auto-discovered).")
+@click.option("-j", "--jobs", type=int, default=1,
+              help="Photo worker processes per pass (0 = one per CPU); videos "
+                   "always encode serially.")
+@click.option("--no-videos", is_flag=True,
+              help="Watch photos only (videos in the inbox are ignored).")
+@click.option("--no-progress", is_flag=True,
+              help="Disable the per-pass progress bar.")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose logging.")
+def watch(inbox, output_path, interval, once, settle, mode, preset, codec,
+          quality, lossless, strip_gps, config_path, jobs, no_videos,
+          no_progress, verbose):
+    """Keep INBOX compressed into an archive folder - the automation core.
+
+    Point it at the folder your phone photos land in (iCloud for Windows,
+    OneDrive/Google Drive camera upload, Syncthing, an import folder) and
+    every new photo/video is compressed into the archive automatically:
+    scan -> compress new/changed files -> sleep -> repeat. Ctrl-C stops it
+    cleanly; --once does a single pass for an external scheduler.
+
+    Sources are NEVER deleted or modified - cleanup of the inbox stays your
+    call. Re-runs are cheap: an unchanged file is skipped from its size+mtime
+    alone (no re-reading), and a file still being synced is left alone until
+    its size and mtime hold still across two scans.
+
+    A Live Photo's paired ~3 s .mov is kept verbatim rather than re-encoded
+    (re-encoding would break the pairing; the still is compressed normally).
+    """
+    _setup_logging(verbose)
+    try:
+        config = _load_config(config_path, mode, codec, quality, None,
+                              strip_gps=strip_gps, lossless=lossless,
+                              preset=preset)
+    except FaceKeepError as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(2)
+
+    in_p = Path(inbox)
+    out_p = Path(output_path)
+    try:
+        same = in_p.resolve() == out_p.resolve()
+    except OSError:
+        same = False
+    if same:
+        click.echo(
+            "watch: the archive directory must differ from the inbox "
+            "(outputs would land beside the sources being watched).",
+            err=True,
+        )
+        sys.exit(2)
+    out_p.mkdir(parents=True, exist_ok=True)
+
+    # Decide video inclusion once, up front, so an excluded class of file is
+    # never even scanned (idle cycles stay metadata-only over what matters)
+    # and the reason is said once instead of per file per cycle.
+    include_videos = config.video.enabled and not no_videos
+    if include_videos and config.mode == "aggressive":
+        include_videos = False
+        click.echo(
+            "watch: aggressive mode does not apply to video (video is "
+            "faithful-only) - videos in the inbox will be skipped.",
+            err=True,
+        )
+    elif include_videos and not video_mod.ffmpeg_available():
+        include_videos = False
+        click.echo(
+            f"watch: videos in the inbox will be skipped - "
+            f"{video_mod._MISSING_FFMPEG_HINT}",
+            err=True,
+        )
+    video_exts = video_mod.VIDEO_EXTENSIONS if include_videos else set()
+    exts = IMAGE_EXTS | video_exts
+
+    # Guardrail 2 honesty (ROADMAP Phase 11): a backup flow must say what the
+    # copy is. Faithful is visually lossless, not bit-exact; aggressive
+    # reconstructs backgrounds on restore.
+    if config.mode == "aggressive":
+        click.echo(
+            "note: aggressive mode reconstructs backgrounds on restore "
+            "(plausible, not faithful). If the archive will be your only "
+            "copy, faithful mode (the default) or --lossless is the honest "
+            "choice."
+        )
+    elif not config.faithful.lossless:
+        click.echo(
+            "note: faithful compression is visually lossless, not bit-exact. "
+            "Use --lossless if the archive will be your ONLY copy of "
+            "irreplaceable originals."
+        )
+
+    photo_fp = index_mod.settings_fingerprint(config)
+    video_fp = index_mod.video_settings_fingerprint(config)
+    db_path = out_p / index_mod.INDEX_FILENAME
+
+    click.echo(
+        f"Watching {in_p} -> {out_p}"
+        + ("" if once else f" every {interval:g}s (Ctrl-C to stop)")
+        + "; sources are never deleted or modified."
+    )
+
+    prev = None  # previous scan's snapshot (path -> (size, mtime_ns))
+    # Files whose last attempt failed/skipped, memoized by the stat they had:
+    # they are NOT retried every cycle (a corrupt file must not burn CPU per
+    # poll) — only when the file changes. In-memory only: a fresh process (or
+    # each --once run) retries once.
+    blocked: dict = {}
+    exit_code = 0
+    try:
+        while True:
+            stats = _scan_stats(in_p, exts)
+            if prev is None:
+                # Bootstrap: pair the first scan with a settle-delayed second
+                # one, so the first pass can already process files that held
+                # still — --once has only one pass, and loop mode shouldn't
+                # sit a full interval before doing anything.
+                time.sleep(settle)
+                prev = stats
+                stats = _scan_stats(in_p, exts)
+            # Stability guard: a file is eligible only when its size+mtime are
+            # identical across two consecutive scans (temp+rename AND in-place
+            # sync writers both show up as a changing stat while unfinished).
+            eligible = [f for f, s in stats.items() if prev.get(f) == s]
+            awaiting = len(stats) - len(eligible)
+            prev = stats
+
+            blocked = {f: s for f, s in blocked.items() if f in stats}
+            held = [f for f in eligible if blocked.get(f) == stats[f]]
+            check = [f for f in eligible if blocked.get(f) != stats[f]]
+
+            # Stat pre-filter (the idle-cycle cost fix): a file whose recorded
+            # size+mtime+settings still match is skipped without reading a
+            # byte. Only the misses go to the batch (which hashes honestly).
+            todo = []
+            unchanged = 0
+            try:
+                with index_mod.ProcessIndex(db_path) as idx:
+                    for f in check:
+                        size, mtime = stats[f]
+                        fp = video_fp if f.suffix.lower() in video_exts else photo_fp
+                        if idx.is_unchanged_stat(f, size, mtime, fp) is not None:
+                            unchanged += 1
+                        else:
+                            todo.append(f)
+            except sqlite3.Error as e:  # a broken cache must never block a run
+                logging.getLogger("facekeep.cli").warning(
+                    "watch: unreadable index (%s); checking all files.", e
+                )
+                todo, unchanged = list(check), 0
+
+            n_ok = n_failed = n_skipped = 0
+            saved = 0
+            if todo:
+                code, summary = _run_batch(
+                    str(in_p), str(out_p), config, jobs=jobs,
+                    no_videos=not include_videos, no_progress=no_progress,
+                    only_files=sorted(todo),
+                )
+                if code == 0 and summary:
+                    n_ok = summary["ok"]
+                    n_failed = summary["failed"]
+                    n_skipped = summary["skipped"]
+                    unchanged += summary["unchanged"]
+                    saved = max(0, summary["total_in"] - summary["total_out"])
+                    for f, status in summary["statuses"].items():
+                        if status in ("failed", "failed-unexpected", "skipped"):
+                            blocked[f] = stats.get(f)
+                        else:
+                            blocked.pop(f, None)
+
+            # The per-cycle summary line (ASCII-only for legacy codepages).
+            parts = []
+            if todo:
+                done = f"{n_ok} ok"
+                if n_failed:
+                    done += f", {n_failed} failed"
+                if n_skipped:
+                    done += f", {n_skipped} skipped"
+                parts.append(f"processed {len(todo)}: {done}")
+                if saved:
+                    parts.append(f"saved {_fmt_size(saved)}")
+            else:
+                parts.append("idle")
+            if unchanged:
+                parts.append(f"{unchanged} unchanged")
+            if awaiting:
+                parts.append(f"{awaiting} not yet stable (still syncing?)")
+            if held:
+                parts.append(
+                    f"{len(held)} failed/skipped earlier "
+                    "(retried when the file changes)"
+                )
+            if not once:
+                parts.append(f"next scan in {interval:g}s")
+            click.echo(f"[watch {time.strftime('%H:%M:%S')}] " + " | ".join(parts))
+
+            if once:
+                exit_code = 1 if n_failed else 0
+                break
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        click.echo("\nwatch: stopped.")
+        sys.exit(0)
+    sys.exit(exit_code)
 
 
 _RESTORE_EXT = {"jpg": ".jpg", "avif": ".avif", "jxl": ".jxl"}

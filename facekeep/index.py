@@ -26,6 +26,16 @@ What identifies "unchanged" (all must match for a skip):
 * **output still present** — the recorded output path must still exist. If the
   user deleted the ``.avif``, we re-make it on the next run even on a cache hit.
 
+Watch-mode stat pre-filter (ROADMAP 11.1): rows additionally record the input's
+**size + mtime_ns** captured at hash time. ``facekeep watch`` polls a folder
+every cycle, and a full SHA-256 read of an unchanged video library per cycle is
+exactly the cost polling must not have — ``is_unchanged_stat`` answers "still
+unchanged?" from metadata alone (size + mtime + fingerprint + output-exists,
+**no hash read**). This is the deliberately weaker rsync-style quick check and
+it is **watch-only**: ``facekeep compress`` keeps the honest full-hash test
+documented above (an edit that preserves size+mtime still busts a compress
+re-run, exactly as before).
+
 Concurrency contract (important): this DB is opened **only in the parent
 process**. ``compress`` reads it once up front to decide what to skip, then —
 after the workers return — writes the new rows in input order. Worker processes
@@ -220,6 +230,9 @@ def video_settings_fingerprint(config: FaceKeepConfig) -> str:
         "preserve_dolby_vision": config.video.preserve_dolby_vision,
         "face_aware": config.video.face_aware,
         "face_vmaf_target": config.video.face_vmaf_target,
+        # Live-Photo pair policy (11.1): decides whether a paired .mov is kept
+        # verbatim or re-encoded — the output artifact differs entirely.
+        "preserve_live_photos": config.video.preserve_live_photos,
     }
     if config.video.face_aware:
         d = config.detector
@@ -246,6 +259,11 @@ class IndexRow:
     original_size: int
     output_path: str
     output_size: int
+    # Input stat captured at hash time (watch-mode stat pre-filter, 11.1).
+    # None on rows written before the columns existed — a stat lookup then
+    # misses and the caller falls back to the full-hash check.
+    input_size: Optional[int] = None
+    input_mtime_ns: Optional[int] = None
 
 
 class ProcessIndex:
@@ -299,12 +317,30 @@ class ProcessIndex:
                     original_size        INTEGER NOT NULL,
                     output_path          TEXT NOT NULL,
                     output_size          INTEGER NOT NULL,
-                    updated_at           TEXT NOT NULL
+                    updated_at           TEXT NOT NULL,
+                    input_size           INTEGER,
+                    input_mtime_ns       INTEGER
                 )
                 """
             )
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             self._conn.commit()
+        else:
+            # Additive migration (11.1): the stat columns are added in place
+            # rather than via a version bump — a bump wipes the table, and a
+            # wiped video row costs a minutes-to-hours re-encode, the exact
+            # work this cache exists to skip. Old rows read back None (a stat
+            # lookup misses; the full-hash path still works).
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(processed)")}
+            added = False
+            for col in ("input_size", "input_mtime_ns"):
+                if col not in cols:
+                    self._conn.execute(
+                        f"ALTER TABLE processed ADD COLUMN {col} INTEGER"
+                    )
+                    added = True
+            if added:
+                self._conn.commit()
 
     # -- queries ------------------------------------------------------------ #
 
@@ -330,6 +366,8 @@ class ProcessIndex:
             original_size=row["original_size"],
             output_path=row["output_path"],
             output_size=row["output_size"],
+            input_size=row["input_size"],
+            input_mtime_ns=row["input_mtime_ns"],
         )
 
     def is_unchanged(
@@ -353,6 +391,34 @@ class ProcessIndex:
             return None
         return row
 
+    def is_unchanged_stat(
+        self, abs_path: str | Path, size: int, mtime_ns: int, fingerprint: str
+    ) -> Optional[IndexRow]:
+        """The metadata-only quick check (watch mode, 11.1): a hit iff the row
+        exists, its recorded input **size + mtime_ns** both match, the settings
+        fingerprint matches, and the recorded output still exists. **No hash is
+        read** — that is the whole point (an idle watch cycle over a big video
+        library must touch metadata only). Returns the row on a hit, else None
+        (including for pre-11.1 rows whose stat columns are NULL — the caller
+        then falls back to the full-hash check).
+
+        Deliberately weaker than :meth:`is_unchanged` (an edit that restores
+        size+mtime is invisible to it), which is why ``facekeep compress``
+        never uses it — only the watch loop, where the per-cycle cost matters.
+        """
+        row = self.lookup(abs_path)
+        if row is None:
+            return None
+        if row.input_size is None or row.input_mtime_ns is None:
+            return None
+        if row.input_size != size or row.input_mtime_ns != mtime_ns:
+            return None
+        if row.settings_fingerprint != fingerprint:
+            return None
+        if not Path(row.output_path).exists():
+            return None
+        return row
+
     # -- writes ------------------------------------------------------------- #
 
     def record(self, abs_path: str | Path, row: IndexRow) -> None:
@@ -363,8 +429,9 @@ class ProcessIndex:
             """
             INSERT INTO processed
                 (abs_path, content_hash, settings_fingerprint, mode, codec,
-                 quality, original_size, output_path, output_size, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 quality, original_size, output_path, output_size, updated_at,
+                 input_size, input_mtime_ns)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(abs_path) DO UPDATE SET
                 content_hash         = excluded.content_hash,
                 settings_fingerprint = excluded.settings_fingerprint,
@@ -374,7 +441,9 @@ class ProcessIndex:
                 original_size        = excluded.original_size,
                 output_path          = excluded.output_path,
                 output_size          = excluded.output_size,
-                updated_at           = excluded.updated_at
+                updated_at           = excluded.updated_at,
+                input_size           = excluded.input_size,
+                input_mtime_ns       = excluded.input_mtime_ns
             """,
             (
                 self._key(abs_path),
@@ -387,6 +456,24 @@ class ProcessIndex:
                 row.output_path,
                 row.output_size,
                 datetime.now(timezone.utc).isoformat(),
+                row.input_size,
+                row.input_mtime_ns,
             ),
+        )
+        self._conn.commit()
+
+    def update_stat(self, abs_path: str | Path, size: int, mtime_ns: int) -> None:
+        """Refresh only the stat columns of an existing row.
+
+        Used on a full-hash cache *hit* whose stat differs from (or predates)
+        the recorded one — e.g. a sync client re-wrote an identical file with a
+        new mtime, or the row was written before the stat columns existed. The
+        refresh lets the next watch cycle stat-hit instead of re-hashing.
+        No-op when the row doesn't exist.
+        """
+        self._conn.execute(
+            "UPDATE processed SET input_size = ?, input_mtime_ns = ? "
+            "WHERE abs_path = ?",
+            (size, mtime_ns, self._key(abs_path)),
         )
         self._conn.commit()

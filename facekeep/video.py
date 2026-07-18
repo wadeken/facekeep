@@ -278,6 +278,12 @@ class VideoInfo:
     # Dolby Vision: the source's DV profile (e.g. 8 for phone 8.4 HLG-base DV)
     # when a DOVI configuration record with an RPU is present, else None.
     dovi_profile: Optional[int] = None
+    # Apple Live-Photo pairing key (11.1): the container-level
+    # com.apple.quicktime.content.identifier tag when present, else None. A
+    # Live Photo's ~3 s .mov carries it (matching the still's EXIF MakerNote
+    # asset identifier); ordinary videos don't — the CLI uses it to confirm a
+    # same-stem photo sibling really is a Live-Photo pair.
+    content_identifier: Optional[str] = None
 
     @property
     def bits_per_pixel_frame(self) -> float:
@@ -374,6 +380,14 @@ def probe_video(path: Union[str, Path]) -> VideoInfo:
         except (TypeError, ValueError):
             return 0
 
+    # Live-Photo pairing key: a QuickTime mdta container tag (measured live:
+    # ffprobe reports it under format.tags with its dotted name as-is).
+    content_identifier = None
+    for key, value in (fmt.get("tags") or {}).items():
+        if key.lower() == "com.apple.quicktime.content.identifier":
+            content_identifier = str(value)
+            break
+
     rotation = 0
     dovi_profile = None
     for sd in video.get("side_data_list", []) or []:
@@ -404,6 +418,7 @@ def probe_video(path: Union[str, Path]) -> VideoInfo:
         rotation=rotation,
         a_codec=audio.get("codec_name") if audio else None,
         dovi_profile=dovi_profile,
+        content_identifier=content_identifier,
     )
 
 

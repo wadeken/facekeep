@@ -498,6 +498,17 @@ class VideoConfig:
     face_aware: bool = True
     # The raised p1 target for face-bearing clips (never lowers vmaf_target).
     face_vmaf_target: float = DEFAULT_FACE_VMAF_TARGET
+    # Live-Photo pair policy (ROADMAP 11.1, measured): keep a Live Photo's
+    # paired ~3 s .mov VERBATIM (copied, never re-encoded) when a same-stem
+    # photo sibling sits beside it AND the .mov really carries Apple's pairing
+    # key (com.apple.quicktime.content.identifier). The pairing key itself
+    # survives our re-encode, but the still-image-time marker lives in a mebx
+    # timed-metadata TRACK that the encode's -map drops structurally — a
+    # re-encoded motion side is no longer a Live Photo to anything. The clip
+    # is tiny, so keeping it costs little and preserves everything. False =
+    # re-encode it like any video (the pairing key is carried; the loss is
+    # documented).
+    preserve_live_photos: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -801,6 +812,11 @@ video:
   # subject). Face-less footage keeps vmaf_target.
   face_aware: {str(v.face_aware).lower()}
   face_vmaf_target: {v.face_vmaf_target}
+  # Live Photos: keep a pair's ~3 s .mov verbatim (same-stem photo sibling +
+  # Apple's pairing key) instead of re-encoding it — a re-encode drops the
+  # still-image-time track, after which nothing treats the clip as a Live
+  # Photo. false = re-encode it like any video.
+  preserve_live_photos: {str(v.preserve_live_photos).lower()}
 """
 
 
