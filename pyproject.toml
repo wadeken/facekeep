@@ -26,7 +26,12 @@ classifiers = [
 
 # Core dependencies: faithful mode works with just these (no AI, no mediapipe).
 dependencies = [
-    "opencv-python>=4.8.0",
+    # <5: OpenCV 5.0 removed the legacy cv2.CascadeClassifier API, which the
+    # offline zero-download default detector (Haar) is built on — an unbounded
+    # install resolved 5.0.0.93 and broke detection everywhere (measured on CI,
+    # 2026-07). Lifting the bound means porting HaarDetector off the legacy
+    # cascade API first.
+    "opencv-python>=4.8.0,<5",
     "numpy>=1.24.0",
     "pillow>=10.0.0",
     "pillow-avif-plugin>=1.4.0",

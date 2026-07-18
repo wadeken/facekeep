@@ -75,6 +75,14 @@ def main(argv: list[str] | None = None) -> int:
         dt = time.monotonic() - t0
         if proc.returncode == 0:
             print(f"[ok]   {rel}  ({dt:.1f}s)")
+        elif proc.returncode == 5:
+            # pytest exit 5 = "no tests collected". For this per-file runner
+            # that means the whole file skipped at collection time — e.g. a
+            # module-level ``pytest.importorskip("pillow_heif")`` on a minimal
+            # install without the [heic] extra (exactly what CI runs). That is
+            # an expected skip, not a failure; a single-process ``pytest``
+            # would have reported it as "1 skipped" and exited 0.
+            print(f"[skip] {rel}  (all tests skipped at collection, {dt:.1f}s)")
         else:
             print(f"[FAIL] {rel}  (exit {proc.returncode}, {dt:.1f}s)")
             failures.append(rel)
