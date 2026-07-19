@@ -749,6 +749,29 @@ The honest documented loss: Apple-Photos re-import as a *live* photo requires
 the original HEIC/JPEG still, which no compressed archive has, whatever the
 policy.
 
+**One-click backup in the GUI (11.2).** The same batch machinery gets a
+friendly front door: a **Backup** tab in `facekeep gui` — pick a source folder
+and an archive folder, press one button. `gui.run_backup` is a browser-free
+*generator* handler (the GUI's pure-handler discipline) that drives
+`cli._run_batch(only_files=[f])` one file at a time — photos first, then the
+serial videos — so the UI gets a live per-file progress tick while outputs,
+index skips, and failure semantics stay byte-identical to a
+`facekeep compress <src> -o <archive>` run (per-file driving is the same
+`only_files=` API the watch loop established; the only deltas are cosmetic —
+no `--jobs` pool, per-call video ETA lines). The run ends with a completion
+report: totals, plus the per-file ledger built by the *exact* `--report`
+machinery (`_run_batch(collect_rows=True)` returns the `ReportRow` list
+in-process; the tab renders it as a table and writes the CSV for download).
+Guardrail 2 is stated in the tab — faithful is visually lossless, **not**
+bit-exact — with a **Lossless** toggle for irreplaceable originals; the tab is
+deliberately faithful-only (aggressive stays on the Compress tab where its
+trade-off is explained per photo), and sources are never deleted or modified.
+The last-used folders persist (best-effort JSON under `~/.cache/facekeep/`) so
+a return visit really is one click. Continuous mode deliberately stays with
+`facekeep watch`: an honest keep-running toggle needs 11.1's loop invariants
+(stability guard, stat pre-filter) extracted for reuse, not a
+full-hash-every-cycle imitation — a tracked follow-up.
+
 ## Components
 
 - **config.py** — `FaceKeepConfig` (dataclasses) with `validate()`, YAML
@@ -928,7 +951,14 @@ policy.
   extra is absent, rather than running the same bicubic slowly and mislabeling
   it) and warns up front that it is slow (a `gr.Info`/`gr.Warning` toast + a
   `show_progress="full"` spinner). The underlying `restore()` is unchanged — the
-  tab only exposes the existing path — so no new fidelity surface.
+  tab only exposes the existing path — so no new fidelity surface. A third
+  **Backup** tab (`run_backup`, 11.2 — see "Effortless backup" above) is the
+  one-click folder flow: a browser-free generator handler that drives
+  `cli._run_batch` per file for live progress, ends with the `--report`-built
+  per-file table + CSV, states the guardrail-2 honesty note with a lossless
+  toggle, and persists the last-used folders (`gui_state.json`, best-effort) —
+  byte-identical outputs to the CLI, faithful-only, and continuous mode stays
+  with `facekeep watch`.
 
 ## Design principles
 

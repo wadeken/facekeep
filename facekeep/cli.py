@@ -823,7 +823,7 @@ def compress(input_path, output_path, mode, preset, codec, quality, auto_tune,
 def _run_batch(input_path, output_path, config, *, dry_run=False,
                report_path=None, jobs=1, no_videos=False, no_progress=False,
                force=False, index_path=None, no_index=False,
-               no_detect_cache=False, only_files=None):
+               no_detect_cache=False, only_files=None, collect_rows=False):
     """The shared folder/file compress machinery (photos + videos), extracted.
 
     This is the body ``compress`` always ran — gather, index skip, the photo
@@ -842,8 +842,18 @@ def _run_batch(input_path, output_path, config, *, dry_run=False,
     ``only_files`` restricts the run to an explicit file list instead of
     gathering from ``input_path`` (the watch loop passes the stability-checked,
     stat-prefiltered set); ``None`` gathers as before.
+
+    ``collect_rows`` additionally builds the per-file :class:`report.ReportRow`
+    ledger — the exact ``--report`` machinery — and returns it as
+    ``summary["rows"]`` *without* writing a CSV, so a caller (the GUI Backup
+    tab, 11.2) can render/aggregate it. ``report_path`` still writes the CSV as
+    before; ``summary["rows"]`` is ``[]`` when neither is requested.
     """
     in_p = Path(input_path)
+    # The per-file ledger is built when a CSV was asked for OR the caller wants
+    # the rows in-process (collect_rows); the flag also tells _process_one that
+    # report-only extras (e.g. the faces count) will actually be consumed.
+    want_report = bool(report_path) or collect_rows
     include_videos = config.video.enabled and not no_videos
     if only_files is not None:
         all_videos = [f for f in only_files
@@ -1113,7 +1123,7 @@ def _run_batch(input_path, output_path, config, *, dry_run=False,
             ) as ex:
                 futures = {
                     ex.submit(_process_one, str(f), targets[f], config, dry_run,
-                              bool(report_path)): f
+                              want_report): f
                     for f in to_process_photos
                 }
                 for fut in _maybe_progress(as_completed(futures), n_photos,
@@ -1123,7 +1133,7 @@ def _run_batch(input_path, output_path, config, *, dry_run=False,
         else:
             for f in _maybe_progress(to_process_photos, n_photos, show_progress):
                 results[f] = _process_one(str(f), targets[f], config, dry_run,
-                                          bool(report_path),
+                                          want_report,
                                           detection_cache=detect_cache,
                                           hand_detector=hand_detector)
     finally:
@@ -1276,7 +1286,7 @@ def _run_batch(input_path, output_path, config, *, dry_run=False,
     unchanged = 0  # cache hits (skipped-unchanged) — counted, not re-encoded
     failed = 0
     skipped = 0
-    rows = []  # per-file ReportRow ledger (only materialized when --report given)
+    rows = []  # per-file ReportRow ledger (materialized only when requested)
     for f in files:
         res = results[f]
         # Videos carry their own tag: they are neither of the photo modes.
@@ -1296,7 +1306,7 @@ def _run_batch(input_path, output_path, config, *, dry_run=False,
             failed += 1
         elif res["status"] == "skipped":
             skipped += 1
-        if report_path:
+        if want_report:
             rows.append(_row_from_result(res, dry_run))
 
     if len(files) > 1 and (total_out or unchanged):
@@ -1328,6 +1338,7 @@ def _run_batch(input_path, output_path, config, *, dry_run=False,
         "total_in": total_in,
         "total_out": total_out,
         "statuses": {f: results[f]["status"] for f in files},
+        "rows": rows,  # [] unless report_path/collect_rows requested the ledger
     }
 
 

@@ -257,6 +257,165 @@ def test_cli_gui_launches_locally_without_sharing(monkeypatch):
     assert calls["share"] is False  # no public tunnel by default
 
 
+# --- one-click backup (ROADMAP 11.2) --------------------------------------
+
+@pytest.fixture(autouse=True)
+def _isolated_gui_state(monkeypatch, tmp_path):
+    """Keep every test away from the real ~/.cache/facekeep/gui_state.json."""
+    monkeypatch.setattr(gui, "_GUI_STATE_PATH",
+                        tmp_path / "gui_state" / "state.json")
+
+
+def _photo(path, seed=0):
+    """A small photo-like JPEG (smooth noise) that AVIF reliably beats on size."""
+    import cv2
+    rng = np.random.default_rng(seed)
+    img = cv2.resize(rng.normal(128, 40, (24, 32, 3)).astype(np.float32),
+                     (320, 240), interpolation=cv2.INTER_CUBIC)
+    cv2.imwrite(str(path), np.clip(img, 0, 255).astype(np.uint8),
+                [cv2.IMWRITE_JPEG_QUALITY, 95])
+    return path
+
+
+def _drain(gen):
+    """Consume a run_backup generator -> (progress ticks, final BackupResult)."""
+    items = list(gen)
+    assert isinstance(items[-1], gui.BackupResult)
+    progress = items[:-1]
+    assert all(isinstance(p, gui.BackupProgress) for p in progress)
+    return progress, items[-1]
+
+
+def test_run_backup_folder(tmp_path):
+    src = tmp_path / "inbox"
+    src.mkdir()
+    _photo(src / "a.jpg", seed=1)
+    _photo(src / "b.jpg", seed=2)
+    dst = tmp_path / "archive"
+
+    progress, res = _drain(gui.run_backup(str(src), str(dst),
+                                          report_dir=str(tmp_path / "rep")))
+    # Live progress: one tick per file, in order, before each file runs.
+    assert [p.done for p in progress] == [0, 1]
+    assert all(p.total == 2 and p.kind == "photo" for p in progress)
+    # The batch really ran: real outputs in the archive, counted as ok.
+    assert res.files == 2 and res.ok == 2 and res.failed == 0
+    outputs = list(dst.glob("a.*")) + list(dst.glob("b.*"))
+    assert len(outputs) == 2
+    # The per-file ledger is the --report machinery's rows (faces filled).
+    assert len(res.rows) == 2
+    assert all(r.status in ("written", "kept-original") for r in res.rows)
+    assert all(r.faces is not None for r in res.rows)
+    # The CSV artifact exists and carries the report header + both rows.
+    csv_text = Path(res.report_path).read_text(encoding="utf-8")
+    assert csv_text.startswith("file,mode,codec")
+    assert "a.jpg" in csv_text and "b.jpg" in csv_text
+    assert "Backup complete" in res.summary
+    assert "not bit-exact" in res.summary  # the guardrail-2 honesty note
+
+
+def test_run_backup_rerun_skips_unchanged(tmp_path):
+    src = tmp_path / "inbox"
+    src.mkdir()
+    _photo(src / "a.jpg", seed=3)
+    dst = tmp_path / "archive"
+    _drain(gui.run_backup(str(src), str(dst)))
+    _, res = _drain(gui.run_backup(str(src), str(dst)))
+    # Second visit: the incremental index skips the unchanged file.
+    assert res.unchanged == 1 and res.ok == 0 and res.failed == 0
+    assert res.rows[0].status == "cached"
+
+
+def test_run_backup_failed_file_is_counted_not_fatal(tmp_path):
+    src = tmp_path / "inbox"
+    src.mkdir()
+    _photo(src / "good.jpg", seed=4)
+    (src / "broken.jpg").write_bytes(b"not a jpeg at all")
+    dst = tmp_path / "archive"
+    _, res = _drain(gui.run_backup(str(src), str(dst)))
+    assert res.ok == 1 and res.failed == 1
+    assert sorted(r.status == "failed" for r in res.rows) == [False, True]
+
+
+def test_run_backup_video_without_ffmpeg_is_skipped(tmp_path, monkeypatch):
+    monkeypatch.setattr("facekeep.video.ffmpeg_available", lambda: False)
+    src = tmp_path / "inbox"
+    src.mkdir()
+    _photo(src / "a.jpg", seed=5)
+    (src / "clip.mp4").write_bytes(b"junk")
+    dst = tmp_path / "archive"
+    progress, res = _drain(gui.run_backup(str(src), str(dst)))
+    # Photos first, then the videos — and the video skips with the hint.
+    assert [p.kind for p in progress] == ["photo", "video"]
+    assert res.files == 2 and res.ok == 1 and res.skipped == 1
+    assert "ffmpeg" in res.summary
+
+
+def test_run_backup_exclude_videos(tmp_path):
+    src = tmp_path / "inbox"
+    src.mkdir()
+    _photo(src / "a.jpg", seed=6)
+    (src / "clip.mp4").write_bytes(b"junk")
+    _, res = _drain(gui.run_backup(str(src), str(tmp_path / "archive"),
+                                   include_videos=False))
+    assert res.files == 1  # the video was never gathered
+
+
+def test_run_backup_refusals(tmp_path):
+    d = tmp_path / "same"
+    d.mkdir()
+    with pytest.raises(FaceKeepError):  # archive == source
+        list(gui.run_backup(str(d), str(d)))
+    with pytest.raises(FaceKeepError):  # missing source
+        list(gui.run_backup(str(tmp_path / "nope"), str(tmp_path / "a")))
+    with pytest.raises(FaceKeepError):  # nothing to back up
+        list(gui.run_backup(str(d), str(tmp_path / "a")))
+    with pytest.raises(FaceKeepError):  # blank folders
+        list(gui.run_backup("", ""))
+
+
+def test_run_backup_persists_last_folders(tmp_path):
+    src = tmp_path / "inbox"
+    src.mkdir()
+    _photo(src / "a.jpg", seed=7)
+    dst = tmp_path / "archive"
+    _drain(gui.run_backup(str(src), str(dst), lossless=False))
+    state = gui.load_gui_state()
+    assert state["backup_source"] == str(src)
+    assert state["backup_archive"] == str(dst)
+    assert state["backup_lossless"] is False
+
+
+def test_gui_state_roundtrip_and_corruption():
+    assert gui.load_gui_state() == {}  # missing file -> empty, no error
+    gui.save_gui_state(backup_source="x")
+    gui.save_gui_state(backup_lossless=True)  # merges, doesn't clobber
+    state = gui.load_gui_state()
+    assert state == {"backup_source": "x", "backup_lossless": True}
+    gui._GUI_STATE_PATH.write_text("{corrupt", encoding="utf-8")
+    assert gui.load_gui_state() == {}  # best-effort: never raises
+
+
+def test_backup_config_is_faithful_with_lossless_toggle():
+    cfg = gui._backup_config(False)
+    assert cfg.mode == "faithful" and cfg.faithful.lossless is False
+    assert gui._backup_config(True).faithful.lossless is True
+
+
+def test_rows_to_table_blank_cells():
+    from facekeep.report import ReportRow
+    table = gui._rows_to_table([
+        ReportRow(file="a.jpg", mode="faithful", status="written",
+                  codec="avif", original_bytes=2048, output_bytes=1024,
+                  ratio=2.0, quality=80, faces=1),
+        ReportRow(file="bad.jpg", mode="faithful", status="failed"),
+    ])
+    assert table[0] == ["a.jpg", "written", "faithful", "avif",
+                        "2.0 KB", "1.0 KB", "2.0x", "80", "1"]
+    # None -> blank cells (never an invented 0), matching the report contract.
+    assert table[1] == ["bad.jpg", "failed", "faithful", "", "", "", "", "", ""]
+
+
 # --- real Blocks UI (skips without the [gui] extra) -----------------------
 
 def test_build_demo_returns_blocks():

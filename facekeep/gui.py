@@ -31,16 +31,32 @@ live before/after wipe slider, a difference heatmap, and SSIM/PSNR — the
 interactive sibling of ``facekeep compare`` (which exports the same view as a
 self-contained HTML file). It reuses the :mod:`facekeep.compare` helpers, so it
 adds no new fidelity surface either.
+
+A third **Backup** tab (ROADMAP 11.2) is the one-click folder flow: pick a
+source folder and an archive folder, press one button, and every photo (and
+video, when ffmpeg is available) is compressed into the archive by the **exact
+CLI batch machinery** — :func:`run_backup` drives ``cli._run_batch`` per file
+(the ``only_files=`` API the watch loop established), so outputs are
+byte-identical to ``facekeep compress`` and re-runs skip unchanged files via
+the same incremental index. It streams per-file progress (photos first, then
+the serial videos), ends with a completion report (totals + a per-file table
+built by the ``--report`` machinery, downloadable as CSV), states the
+guardrail-2 honesty note (visually lossless ≠ bit-exact — with a lossless
+toggle), and persists the last-used folders so a return visit really is one
+click. Sources are never deleted or modified. Continuous watching stays with
+``facekeep watch`` (the CLI automation core).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import json
 from pathlib import Path
 import tempfile
+from typing import List
 
 import cv2
 import numpy as np
 
-from . import compare as compare_mod, encoders, metrics
+from . import compare as compare_mod, encoders, metrics, report as report_mod
 from .config import PRESET_NAMES, FaceKeepConfig, apply_preset
 from .exceptions import ConfigError, FaceKeepError
 from .imageio import load as load_image
@@ -332,6 +348,254 @@ def compare_images(
     )
 
 
+# --- one-click backup (ROADMAP 11.2) ---------------------------------------
+
+# Last-used GUI state (e.g. the Backup tab's folders) — a tiny best-effort JSON
+# under the user-global facekeep cache dir (the models/detections precedent).
+# Losing or corrupting it only costs prefilled defaults, never correctness.
+_GUI_STATE_PATH = Path.home() / ".cache" / "facekeep" / "gui_state.json"
+
+_BACKUP_TABLE_HEADERS = [
+    "file", "status", "mode", "codec", "before", "after", "ratio",
+    "quality", "faces",
+]
+
+
+def load_gui_state() -> dict:
+    """Read the persisted GUI state (last-used folders). Best-effort: {} on any error."""
+    try:
+        with open(_GUI_STATE_PATH, encoding="utf-8") as fh:
+            state = json.load(fh)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_gui_state(**updates) -> None:
+    """Merge ``updates`` into the persisted GUI state. Best-effort: never raises."""
+    state = load_gui_state()
+    state.update(updates)
+    try:
+        _GUI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_GUI_STATE_PATH, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=2)
+    except OSError:
+        pass
+
+
+@dataclass
+class BackupProgress:
+    """One live progress tick: the file about to be processed + running counts."""
+
+    done: int      # files finished so far
+    total: int
+    current: str   # name of the file being processed now
+    kind: str      # "photo" | "video"
+    ok: int = 0
+    unchanged: int = 0
+    failed: int = 0
+    skipped: int = 0
+    saved_bytes: int = 0
+
+
+@dataclass
+class BackupResult:
+    """The completion report of a backup run (totals + the per-file ledger)."""
+
+    files: int
+    ok: int
+    unchanged: int
+    failed: int
+    skipped: int
+    total_in: int
+    total_out: int
+    rows: List[report_mod.ReportRow] = field(default_factory=list)
+    report_path: str = ""  # the written CSV (the --report machinery's artifact)
+    summary: str = ""      # Markdown
+
+
+def _backup_config(lossless: bool = False) -> FaceKeepConfig:
+    """The Backup tab's config: faithful defaults + the lossless toggle.
+
+    Backup is deliberately faithful-only (the honest default for a flow whose
+    output may become the user's only copy); aggressive stays on the Compress
+    tab where its trade-off is explained per photo.
+    """
+    config = FaceKeepConfig()
+    config.faithful.lossless = bool(lossless)
+    config.validate()
+    return config
+
+
+def run_backup(
+    source_dir: str,
+    archive_dir: str,
+    *,
+    lossless: bool = False,
+    include_videos: bool = True,
+    report_dir: str | None = None,
+):
+    """One-click folder backup: the browser-free generator core of the Backup tab.
+
+    Yields a :class:`BackupProgress` before each file and a final
+    :class:`BackupResult` (always the last item). Each file runs through
+    ``cli._run_batch(only_files=[f])`` — the exact CLI machinery, driven one
+    file at a time so the UI gets live per-file progress — photos first, then
+    the videos (which the batch already encodes serially). Outputs, the
+    incremental-index skip behavior, and the per-file ledger rows are therefore
+    identical to a ``facekeep compress <src> -o <archive>`` run; the only
+    differences are cosmetic (no ``--jobs`` pool, per-call video ETA lines).
+
+    The per-file :class:`report.ReportRow` ledger is also written as a CSV
+    (into ``report_dir``, a fresh temp dir by default) so the UI can offer a
+    download. The last-used folders are persisted (:func:`save_gui_state`) as
+    soon as validation passes, so even an interrupted run remembers them.
+
+    Raises :class:`FaceKeepError` on bad folders (missing source, source ==
+    archive, nothing to back up) — before the first file is touched.
+    """
+    # Lazy: the CLI module hosts the shared batch machinery (_run_batch is the
+    # extracted `compress` body the watch loop drives too) — not a new pipeline.
+    from . import video as video_mod
+    from .cli import IMAGE_EXTS, _gather, _run_batch
+
+    if not source_dir or not str(source_dir).strip():
+        raise FaceKeepError("Pick a source folder (where your photos are).")
+    if not archive_dir or not str(archive_dir).strip():
+        raise FaceKeepError(
+            "Pick an archive folder (where the compressed copies go)."
+        )
+    src = Path(str(source_dir).strip())
+    dst = Path(str(archive_dir).strip())
+    if not src.is_dir():
+        raise FaceKeepError(f"Source folder does not exist: {src}")
+    try:
+        same = src.resolve() == dst.resolve()
+    except OSError:
+        same = False
+    if same:
+        raise FaceKeepError(
+            "The archive folder must differ from the source folder "
+            "(compressed copies would land beside the originals)."
+        )
+
+    config = _backup_config(lossless)
+    photos = _gather(src, IMAGE_EXTS)
+    videos = (
+        _gather(src, video_mod.VIDEO_EXTENSIONS)
+        if include_videos and config.video.enabled else []
+    )
+    # Photos first, then the videos — the batch's own serial-video discipline.
+    files = [(f, "photo") for f in photos] + [(f, "video") for f in videos]
+    if not files:
+        raise FaceKeepError(f"No photos or videos found in: {src}")
+    ffmpeg_note = bool(videos) and not video_mod.ffmpeg_available()
+
+    dst.mkdir(parents=True, exist_ok=True)
+    # Persist as soon as the folders are known-good: a return visit is one
+    # click even if this run is cancelled midway.
+    save_gui_state(backup_source=str(src), backup_archive=str(dst),
+                   backup_lossless=bool(lossless))
+
+    ok = unchanged = failed = skipped = 0
+    total_in = total_out = 0
+    rows: List[report_mod.ReportRow] = []
+    for i, (f, kind) in enumerate(files):
+        yield BackupProgress(
+            done=i, total=len(files), current=f.name, kind=kind,
+            ok=ok, unchanged=unchanged, failed=failed, skipped=skipped,
+            saved_bytes=max(0, total_in - total_out),
+        )
+        code, summary = _run_batch(
+            str(src), str(dst), config, no_progress=True,
+            no_videos=not include_videos, only_files=[f], collect_rows=True,
+        )
+        if code == 0 and summary:
+            ok += summary["ok"]
+            unchanged += summary["unchanged"]
+            failed += summary["failed"]
+            skipped += summary["skipped"]
+            total_in += summary["total_in"]
+            total_out += summary["total_out"]
+            rows.extend(summary["rows"])
+        else:  # defensive: a singleton batch that couldn't run at all
+            failed += 1
+            rows.append(report_mod.ReportRow(
+                file=f.name, mode=config.mode, status="failed"))
+
+    out_dir = Path(report_dir) if report_dir else Path(
+        tempfile.mkdtemp(prefix="facekeep-gui-"))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_mod.write_report(
+        rows, str(out_dir / "facekeep_backup_report.csv"))
+
+    yield BackupResult(
+        files=len(files), ok=ok, unchanged=unchanged, failed=failed,
+        skipped=skipped, total_in=total_in, total_out=total_out, rows=rows,
+        report_path=str(report_path),
+        summary=_backup_summary(
+            len(files), ok, unchanged, failed, skipped, total_in, total_out,
+            lossless=lossless, ffmpeg_note=ffmpeg_note),
+    )
+
+
+def _backup_summary(files: int, ok: int, unchanged: int, failed: int,
+                    skipped: int, total_in: int, total_out: int, *,
+                    lossless: bool, ffmpeg_note: bool) -> str:
+    """The completion-report Markdown (totals + the honesty notes)."""
+    counts = [f"**{ok} compressed**"]
+    if unchanged:
+        counts.append(f"{unchanged} already backed up (unchanged)")
+    if failed:
+        counts.append(f"**{failed} failed**")
+    if skipped:
+        counts.append(f"{skipped} skipped")
+    lines = [f"### Backup complete — {files} file(s)", " · ".join(counts)]
+    if total_out:
+        ratio = total_in / total_out
+        lines.append(
+            f"**Size:** {_fmt_size(total_in)} → {_fmt_size(total_out)} "
+            f"(**{ratio:.1f}× smaller** — saved {_fmt_size(total_in - total_out)})"
+        )
+    if ffmpeg_note:
+        lines.append(
+            "_Videos were skipped: the external `ffmpeg` binary was not found. "
+            "Photos are unaffected; install ffmpeg to compress videos too._"
+        )
+    lines.append(
+        "_Lossless (bit-exact) encode — the archive copies are exact._"
+        if lossless else
+        "_Faithful output is visually lossless, **not bit-exact**. Turn on "
+        "Lossless if the archive will be your only copy of irreplaceable "
+        "originals._"
+    )
+    lines.append("_Sources were not deleted or modified._")
+    return "\n\n".join(lines)
+
+
+def _rows_to_table(rows: List[report_mod.ReportRow]) -> list:
+    """ReportRow ledger -> display table (list of lists, human-readable sizes).
+
+    Pure and gradio-free so it is unit-testable; column order matches
+    ``_BACKUP_TABLE_HEADERS``. ``None`` renders as a blank cell (the report
+    module's honesty rule: blank means "not measured", never an invented 0).
+    """
+    table = []
+    for r in rows:
+        table.append([
+            r.file,
+            r.status,
+            r.mode,
+            r.codec or "",
+            "" if r.original_bytes is None else _fmt_size(r.original_bytes),
+            "" if r.output_bytes is None else _fmt_size(r.output_bytes),
+            "" if r.ratio is None else f"{r.ratio:.1f}x",
+            "" if r.quality is None else str(r.quality),
+            "" if r.faces is None else str(r.faces),
+        ])
+    return table
+
+
 def build_demo(config: FaceKeepConfig | None = None):
     """Build the Gradio ``Blocks`` UI (gradio imported lazily — needs ``[gui]``).
 
@@ -470,6 +734,78 @@ def build_demo(config: FaceKeepConfig | None = None):
                 inputs=[cmp_orig, cmp_file, cmp_amplify, cmp_ai],
                 outputs=[cmp_slider, cmp_diff, cmp_summary],
                 show_progress="full",
+            )
+
+        with gr.Tab("Backup"):
+            gr.Markdown(
+                "Back up a whole folder in one click: every photo (and video, "
+                "when the external `ffmpeg` is installed) is compressed into "
+                "the archive folder — byte-identical to `facekeep compress`. "
+                "A return visit is cheap: unchanged files are skipped "
+                "automatically, so you can re-run any time.\n\n"
+                "**Honesty note:** faithful compression is **visually "
+                "lossless, not bit-exact**. If the archive will be your "
+                "**only** copy of irreplaceable originals, turn on "
+                "**Lossless**. Sources are never deleted or modified.\n\n"
+                "_For hands-off continuous backup, run `facekeep watch "
+                "<inbox> -o <archive>` in a terminal — it keeps the folder "
+                "compressed as new files arrive._"
+            )
+            state = load_gui_state()
+            with gr.Row():
+                with gr.Column(scale=1):
+                    bk_src = gr.Textbox(
+                        value=state.get("backup_source", ""),
+                        label="Source folder (your photos)",
+                        placeholder=r"e.g. C:\Users\me\Pictures\inbox")
+                    bk_dst = gr.Textbox(
+                        value=state.get("backup_archive", ""),
+                        label="Archive folder (compressed copies)",
+                        placeholder=r"e.g. D:\photo-archive")
+                    bk_lossless = gr.Checkbox(
+                        value=bool(state.get("backup_lossless", False)),
+                        label="Lossless (bit-exact archival — larger files)")
+                    bk_videos = gr.Checkbox(
+                        value=True,
+                        label="Include videos (slow — an overnight-batch "
+                              "feature; needs ffmpeg)")
+                    bk_run = gr.Button("Back up now", variant="primary")
+                with gr.Column(scale=2):
+                    bk_status = gr.Markdown()
+                    bk_table = gr.Dataframe(
+                        headers=list(_BACKUP_TABLE_HEADERS),
+                        label="Per-file report", interactive=False)
+                    bk_csv = gr.File(label="Download CSV report")
+
+            def _run_backup_ui(src, dst, lossless, include_videos):
+                # A generator handler: each yield updates the UI live — one
+                # tick per file (photos first, then the serial videos), then
+                # the completion report + table + CSV download.
+                try:
+                    for item in run_backup(src, dst, lossless=lossless,
+                                           include_videos=include_videos):
+                        if isinstance(item, BackupResult):
+                            yield (item.summary, _rows_to_table(item.rows),
+                                   item.report_path)
+                        else:
+                            counts = (f"{item.ok} ok · {item.unchanged} "
+                                      f"unchanged · {item.failed} failed")
+                            if item.saved_bytes:
+                                counts += (f" · saved "
+                                           f"{_fmt_size(item.saved_bytes)}")
+                            yield (
+                                f"Backing up **{item.done + 1}/{item.total}**"
+                                f" — `{item.current}` ({item.kind})…\n\n"
+                                f"{counts}",
+                                gr.update(), gr.update(),
+                            )
+                except FaceKeepError as e:
+                    yield f"**Error:** {e}", None, None
+
+            bk_run.click(
+                _run_backup_ui,
+                inputs=[bk_src, bk_dst, bk_lossless, bk_videos],
+                outputs=[bk_status, bk_table, bk_csv],
             )
     return demo
 
