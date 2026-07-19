@@ -7,3 +7,6 @@
 !.gitignore
 !hero.png
 !proof.png
+# hdr_proof.jpg: FaceKeep's own aggressive-restore Ultra HDR JPEG output of the
+# ceiling-lamp Android sample (no people, no GPS EXIF) — approved public 2026-07-19.
+!hdr_proof.jpg
