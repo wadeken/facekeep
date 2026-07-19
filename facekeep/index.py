@@ -92,6 +92,12 @@ def settings_fingerprint(config: FaceKeepConfig) -> str:
             "chroma": config.faithful.chroma,
             # 10 vs 12-bit changes the encoded bytes on a high-bit AVIF source.
             "output_bit_depth": config.faithful.output_bit_depth,
+            # Gain-map carry (9.6) re-encodes an AVIF output as a gain-map
+            # (HDR) AVIF when the source has one; both knobs shape those bytes
+            # at COMPRESS time — unlike aggressive.gain_map_headroom, which is
+            # restore-side — so both must bust the cache.
+            "preserve_gain_map": config.faithful.preserve_gain_map,
+            "gain_map_headroom": config.faithful.gain_map_headroom,
             "skip_if_larger": config.faithful.skip_if_larger,
             # verify_thorough changes what we measure but not the output bytes;
             # verify can keep/replace the output on a round-trip failure, so it is

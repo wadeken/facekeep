@@ -96,6 +96,28 @@ Faces influence two things only:
    `--quality` turns auto-tune off (`--no-auto-tune` too), so a chosen quality is
    honored directly.
 
+**HDR gain-map carry (ROADMAP 9.6).** A real phone HDR photo is an 8-bit SDR
+base plus an HDR *gain map* (see the Phase-9 discussion in the aggressive
+section — the mechanism is the same); encoding only the base would silently
+flatten it to SDR. So when the source carries a gain map and the concrete
+output codec is AVIF, faithful mode re-encodes the output as a
+backward-compatible **gain-map (HDR) AVIF** (`avifgainmaputil combine`, the
+same opt-in machine-local libavif tool family as `avifenc`): SDR viewers see
+the base, HDR displays extend the highlights — exactly the source photo's
+mechanism, and opening the file is still the restore. Unlike the
+aggressive-mode re-attach there is no hallucinated-background caveat: the base
+is the real full-resolution encode at the tuned quality. The auto-tune/chroma
+machinery is unchanged (it shapes the SDR base), and an Android Ultra HDR
+source's declared hdrgm math is honored (9.4). Graceful degradation
+everywhere, warned: a missing binary, a JXL/WebP output, lossless mode (its
+bit-exact-SDR promise wins), a deep-color uint16 source (already HDR by
+depth), or any combine failure → today's SDR output, never a failed compress.
+The documented trade on the HDR path: color is declared via CICP (P3/sRGB —
+equivalent for every phone profile) instead of embedding the ICC profile,
+because the combine tool rejects profiled inputs. `faithful.preserve_gain_map`
+(default on) and `faithful.gain_map_headroom` (the Apple-map fallback) are
+compress-side → both feed `settings_fingerprint`.
+
 Detection failure never blocks encoding — faithful mode degrades gracefully to a
 plain whole-image encode.
 

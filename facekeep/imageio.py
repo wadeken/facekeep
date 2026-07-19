@@ -66,8 +66,9 @@ class LoadedImage:
     gain_map: Optional[np.ndarray] = None  # HDR gain map (iPhone HDR): typically a
     # single-channel uint8 array at half the base resolution, kept UPRIGHT (it is
     # rotated together with the base image, so the two stay aligned). None when
-    # the source carries none. Carried for preservation (Phase 9); nothing in the
-    # pipeline consumes it yet.
+    # the source carries none. Consumed by aggressive compress (stored in the
+    # .fkeep, Phase 9.2+) and by faithful mode's AVIF output (carried into a
+    # gain-map HDR AVIF, ROADMAP 9.6).
     gain_map_meta: Optional[dict] = None  # informational: {"source": "heic-aux",
     # "urn": <aux type URN>} or {"source": "jpeg-mpf", "frame_index": int,
     # "xmp": <the gain-map frame's raw XMP bytes>}. None when gain_map is None.

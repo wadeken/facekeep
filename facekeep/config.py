@@ -128,6 +128,33 @@ class FaithfulConfig:
     # so we never make a file worse.
     skip_if_larger: bool = True
 
+    # HDR gain-map carry (ROADMAP 9.6). A real phone HDR photo is an 8-bit base
+    # plus an HDR *gain map* (imageio.load extracts it); without this, a
+    # faithful encode keeps only the SDR base and the HDR headroom is lost.
+    # When on (the default — the Phase 9 "just preserve it" decision) and the
+    # source carried a gain map, an AVIF output is written as a
+    # backward-compatible **gain-map (HDR) AVIF** via the external
+    # `avifgainmaputil` binary (`combine` — the same opt-in machine-local
+    # libavif family as avifenc): SDR viewers see the base, HDR displays extend
+    # the highlights, exactly like the source photo. Graceful degradation
+    # everywhere: AVIF output only (JXL/WebP have no gain-map tooling → SDR +
+    # warning; a `both` run stays size-ruled on the SDR encodes), missing
+    # binary → today's SDR bytes + warning (the default zero-download install
+    # is byte-identical), lossless mode keeps its bit-exact-SDR promise
+    # (warned), and a deep-color uint16 source keeps the 10/12-bit path (the
+    # gain-map mechanism is an 8-bit base by construction). ICC trade: the
+    # combine tool refuses ICC-profiled inputs, so the HDR output declares
+    # color via CICP (P3-by-name / sRGB — equivalent for every phone profile)
+    # instead of embedding the source profile. Map-less sources are
+    # byte-identical either way. Output-affecting → in
+    # index.settings_fingerprint.
+    preserve_gain_map: bool = True
+    # HDR headroom (stops) used to rebuild the fully-applied alternate when the
+    # source declares no hdrgm math (Apple maps; 3.0 matches the real-photo
+    # libavif reference). Compress-side here — unlike the restore-side
+    # aggressive.gain_map_headroom — so it IS fingerprinted.
+    gain_map_headroom: float = 3.0
+
 
 @dataclass
 class AggressiveConfig:
@@ -744,6 +771,12 @@ faithful:
   # High-bit AVIF output depth (10 | 12); only used for a 16-bit source via the
   # external avifenc CLI, otherwise ignored. Never widens an 8-bit source.
   output_bit_depth: {f.output_bit_depth}
+  # HDR: carry a phone photo's HDR gain map into an AVIF output -> a
+  # backward-compatible HDR AVIF (needs the avifgainmaputil binary; without it,
+  # or for jxl/webp/lossless output: SDR + a warning). Color on that path is
+  # declared via CICP (P3/sRGB), not the embedded ICC profile.
+  preserve_gain_map: {str(f.preserve_gain_map).lower()}
+  gain_map_headroom: {f.gain_map_headroom}   # HDR headroom (stops) for Apple-style maps
 
 # Aggressive mode (only when `mode: aggressive`): extreme compression; the
 # background is hallucinated on restore. Faces/hands/risky regions kept sharp.
@@ -871,6 +904,11 @@ class FaceKeepConfig:
             raise ConfigError(
                 f"Unknown faithful.target_metric: {self.faithful.target_metric!r} "
                 "(expected 'ssim' or 'ssimulacra2')"
+            )
+        if not 0 < self.faithful.gain_map_headroom <= 6:
+            raise ConfigError(
+                "faithful.gain_map_headroom must be between 0 (exclusive) "
+                "and 6 stops"
             )
         if not 0.05 <= self.aggressive.bg_scale <= 1.0:
             raise ConfigError("aggressive.bg_scale must be between 0.05 and 1.0")

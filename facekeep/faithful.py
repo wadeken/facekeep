@@ -55,6 +55,10 @@ class FaithfulResult:
     # fidelity number we never computed). ``quality_metric`` names the method.
     quality_score: Optional[float] = None
     quality_metric: Optional[str] = None
+    # True when the output is a gain-map (HDR) AVIF — the source's HDR gain map
+    # was really carried into the written file (ROADMAP 9.6). False for SDR
+    # output, map-less sources, and every degraded/fallback path.
+    gain_map_carried: bool = False
 
     @property
     def ratio(self) -> float:
@@ -330,6 +334,84 @@ def _encode_best_codec(
     return best
 
 
+def _attach_gain_map(
+    data: bytes,
+    codec_used: str,
+    quality_used: int,
+    loaded: "imageio.LoadedImage",
+    cfg,
+) -> tuple[bytes, bool]:
+    """Carry the source's HDR gain map into the output (ROADMAP 9.6).
+
+    When the source carried a gain map (``loaded.gain_map``, Phase 9.1) and the
+    concrete output codec is AVIF, re-encode the output as a backward-compatible
+    **gain-map (HDR) AVIF** via ``encoders.encode_gainmap_avif`` (the 9.2
+    restore recipe: rebuild the fully-applied HDR alternate — honoring the
+    source's declared hdrgm math when it rode in — and ``avifgainmaputil
+    combine``). Unlike the aggressive path there is no hallucinated-background
+    caveat: the base here is the real full-resolution image at the tuned
+    quality, so the carry is as honest as faithful mode itself.
+
+    Returns ``(encoded_bytes, carried)`` — on any non-AVIF/degraded path the
+    input ``data`` is returned unchanged with ``carried=False`` (graceful
+    degradation, offline-first: the default zero-download install emits
+    byte-identical SDR output plus a warning).
+
+    Documented trades on the HDR path (both inherited from ``combine``): color
+    is declared via CICP (P3-by-name / sRGB) rather than the embedded ICC
+    profile, and the base is encoded by libavif's own encoder at
+    ``quality_used`` (the tuned quality number carries over; the plugin's
+    chroma/speed knobs do not apply to this encoder).
+    """
+    if loaded.gain_map is None or not cfg.preserve_gain_map:
+        return data, False
+    if cfg.lossless:
+        # Lossless promises a bit-exact base; combine re-encodes it lossily.
+        logger.warning(
+            "Source carries an HDR gain map, but lossless mode keeps its "
+            "bit-exact promise and writes SDR (the gain-map AVIF path "
+            "re-encodes the base). Disable faithful.lossless to carry HDR."
+        )
+        return data, False
+    if loaded.source_bit_depth > 8:
+        # Gain-map HDR is an 8-bit base by construction; a genuine uint16
+        # source already keeps its HDR through the deep-color 10/12-bit path.
+        logger.warning(
+            "Source is high-bit AND carries a gain map; keeping the 10/12-bit "
+            "deep-color output and dropping the gain map (the gain-map AVIF "
+            "base is 8-bit by construction)."
+        )
+        return data, False
+    if codec_used != "avif":
+        logger.warning(
+            "Source carries an HDR gain map, but only an AVIF output can "
+            "carry it; writing SDR %s. Set faithful.codec: avif to preserve "
+            "HDR.", codec_used,
+        )
+        return data, False
+    if not encoders.avifgainmaputil_available():
+        logger.warning(
+            "Source carries an HDR gain map, but the avifgainmaputil binary "
+            "was not found (set FACEKEEP_AVIFENC or put the libavif tools on "
+            "PATH); writing SDR AVIF."
+        )
+        return data, False
+    try:
+        hdr = encoders.encode_gainmap_avif(
+            loaded.image, loaded.gain_map,
+            headroom=cfg.gain_map_headroom,
+            gain_map_params=(loaded.gain_map_meta or {}).get("hdrgm"),
+            quality=quality_used,
+            exif=loaded.exif, icc=loaded.icc,
+        )
+        return hdr, True
+    except Exception as e:  # noqa: BLE001 - HDR carry must never fail the encode
+        logger.warning(
+            "HDR gain-map carry failed (%s); writing SDR AVIF instead.", e,
+        )
+        return data, False
+
+
 def compress(
     image_path: str,
     output_path: Optional[str] = None,
@@ -413,6 +495,16 @@ def compress(
     except Exception as e:  # noqa: BLE001
         raise CompressionError(f"Faithful encode failed for {image_path}: {e}") from e
 
+    # HDR gain-map carry (ROADMAP 9.6): a gain-map-bearing source with an AVIF
+    # output becomes a backward-compatible gain-map (HDR) AVIF; every other
+    # combination keeps `data` unchanged (warned where HDR is really lost).
+    # This runs BEFORE verify and skip-if-larger on purpose: verify must check
+    # the bytes actually written, and the size decision must see the final
+    # (slightly larger) HDR file — in a dry run too, so its numbers stay real.
+    data, gain_map_carried = _attach_gain_map(
+        data, codec_used, quality_used, loaded, cfg
+    )
+
     # Verify the encoded output decodes and matches the source before writing,
     # so a corrupt encode fails loudly instead of silently producing a bad file.
     # Under --verify-thorough this also returns the downscaled-SSIM it measured,
@@ -477,4 +569,5 @@ def compress(
         codec=codec_used,
         quality_score=quality_score,
         quality_metric=quality_metric,
+        gain_map_carried=gain_map_carried,
     )

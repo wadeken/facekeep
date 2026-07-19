@@ -353,6 +353,7 @@ def _process_one(file_str: str, target: str, config: FaceKeepConfig,
                 codec=res.codec,
                 quality=res.quality_used,
                 ssim=res.quality_score,
+                gain_map_carried=res.gain_map_carried,
                 output_name=res.output_path.name,
             )
         else:
@@ -582,11 +583,12 @@ def _print_result(res: dict, tag: str, dry_run: bool) -> None:
             )
         else:
             verb = "WOULD WRITE" if dry_run else "OK "
+            hdr_note = ", HDR" if res.get("gain_map_carried") else ""
             click.echo(
                 f"{verb} {_fmt_size(res['original_size'])} -> "
                 f"{_fmt_size(res['compressed_size'])} ({res['ratio']:.1f}x, "
-                f"{res['faces']} face(s), {res['codec']} q{res['quality']}) "
-                f"-> {res['output_name']}"
+                f"{res['faces']} face(s), {res['codec']} q{res['quality']}"
+                f"{hdr_note}) -> {res['output_name']}"
             )
     else:  # aggressive success
         verb = "WOULD WRITE" if dry_run else "OK "
