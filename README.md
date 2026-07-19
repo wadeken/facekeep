@@ -181,19 +181,29 @@ as a faithful HDR AVIF, and a real Android Ultra HDR photo **2.8 MB → 0.5 MB
 (5.3×)** faithful — or a **443 KB `.fkeep` (6.5×)** in aggressive mode, with
 the gain map riding byte-for-byte back into the restored Ultra HDR JPEG.
 
-**The image below is the proof, not a screenshot of it.** It is FaceKeep's
-actual aggressive-mode restore output — an Ultra HDR JPEG rebuilt from a
-`.fkeep`, the gain map carried byte-for-byte from a real Android phone photo.
-View this page in Chrome or Edge **on an HDR display** and the lamp genuinely
-glows brighter than the page's white — something no screenshot can fake. On an
-SDR screen you see the normal SDR base image: that's the backward-compatible
-design working.
+**The pair below is the proof, not a screenshot of it.** Both are the same
+FaceKeep aggressive-mode restore of a real Android phone photo. The left one
+had its gain map stripped — what a map-dropping tool leaves you. The right one
+is FaceKeep's actual output: an Ultra HDR JPEG rebuilt from a `.fkeep`, the
+gain map carried byte-for-byte. View this page in Chrome or Edge **on an HDR
+display**: only the right lamp genuinely glows brighter than the page's white
+— something no screenshot can fake. (On an SDR screen the two look identical;
+that's the backward-compatible design doing its job.)
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/wadeken/facekeep/main/assets/hdr_proof.jpg"
-       alt="FaceKeep HDR proof: an actual Ultra HDR JPEG restored from a .fkeep — on an HDR display in Chrome the ceiling lamp glows beyond SDR white"
-       width="55%">
-</p>
+<table align="center">
+  <tr>
+    <th align="center">gain map dropped (most tools)</th>
+    <th align="center">FaceKeep restore — Ultra HDR kept</th>
+  </tr>
+  <tr>
+    <td><img src="https://raw.githubusercontent.com/wadeken/facekeep/main/assets/hdr_proof_sdr.jpg"
+             alt="SDR reference: the same restored photo with the HDR gain map stripped — the lamp stays flat even on an HDR display"
+             width="100%"></td>
+    <td><img src="https://raw.githubusercontent.com/wadeken/facekeep/main/assets/hdr_proof.jpg"
+             alt="FaceKeep HDR proof: an actual Ultra HDR JPEG restored from a .fkeep — on an HDR display in Chrome the ceiling lamp glows beyond SDR white"
+             width="100%"></td>
+  </tr>
+</table>
 
 > The faithful-mode HDR-AVIF carry uses libavif's `avifgainmaputil` binary
 > (opt-in, machine-local); without it you get today's SDR output with a

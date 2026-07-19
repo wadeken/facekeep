@@ -9,4 +9,7 @@
 !proof.png
 # hdr_proof.jpg: FaceKeep's own aggressive-restore Ultra HDR JPEG output of the
 # ceiling-lamp Android sample (no people, no GPS EXIF) — approved public 2026-07-19.
+# hdr_proof_sdr.jpg: the same frame with the gain map stripped (the README's
+# side-by-side SDR reference) — same approval, same privacy facts.
 !hdr_proof.jpg
+!hdr_proof_sdr.jpg
