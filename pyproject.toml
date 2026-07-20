@@ -88,6 +88,15 @@ progress = [
 gui = [
     "gradio>=4.0.0",
 ]
+# Desktop tray app (`facekeep app`, ROADMAP 11.3): a system-tray shell over the
+# watch loop + the local GUI, Windows-first. Includes gradio because the tray's
+# main entry opens the GUI. Like [gui] it is deliberately NOT in `all` (the web
+# stack has no place in the pipeline bundle); the packaged Windows build
+# (packaging/windows/) bundles exactly this extra — and never torch/[ai].
+app = [
+    "pystray>=0.19.0",
+    "gradio>=4.0.0",
+]
 # Convenience: every optional *runtime* feature at once (AI restore, HEIC input,
 # MediaPipe detector, progress bar). Excludes `dev` (test/lint tooling). Note it
 # still does NOT pull the external `avifenc` CLI — that is machine-local, not pip

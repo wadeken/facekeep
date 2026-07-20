@@ -9,7 +9,12 @@ dist/
 .venv/
 .venv-mediapipe/
 .venv-pkgtest/
+.venv-package/
 venv/
+
+# Windows packaging (ROADMAP 11.3): staged binaries + generated icon, never committed
+packaging/windows/stage/
+packaging/windows/FaceKeep.ico
 
 # Test / coverage
 .pytest_cache/

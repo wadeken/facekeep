@@ -1359,6 +1359,176 @@ def _scan_stats(root: Path, exts: set) -> dict:
     return out
 
 
+def _decide_watch_videos(config, no_videos: bool) -> "tuple[bool, str | None]":
+    """Decide video inclusion for a watch run once, up front.
+
+    Returns ``(include_videos, reason)`` where ``reason`` is the message to
+    surface when videos were excluded for a *sayable* cause (aggressive mode /
+    missing ffmpeg) — said once at startup, never per file per cycle. Shared
+    by the `watch` command and the tray app (facekeep.app, 11.3).
+    """
+    include_videos = config.video.enabled and not no_videos
+    if include_videos and config.mode == "aggressive":
+        return False, (
+            "watch: aggressive mode does not apply to video (video is "
+            "faithful-only) - videos in the inbox will be skipped."
+        )
+    if include_videos and not video_mod.ffmpeg_available():
+        return False, (
+            f"watch: videos in the inbox will be skipped - "
+            f"{video_mod._MISSING_FFMPEG_HINT}"
+        )
+    return include_videos, None
+
+
+def _watch_honesty_note(config) -> "str | None":
+    """The guardrail-2 honesty note (ROADMAP Phase 11) for a backup flow.
+
+    A backup flow must say what the copy is: faithful is visually lossless,
+    not bit-exact; aggressive reconstructs backgrounds on restore. Returns
+    None when lossless mode already keeps the bit-exact promise.
+    """
+    if config.mode == "aggressive":
+        return (
+            "note: aggressive mode reconstructs backgrounds on restore "
+            "(plausible, not faithful). If the archive will be your only "
+            "copy, faithful mode (the default) or --lossless is the honest "
+            "choice."
+        )
+    if not config.faithful.lossless:
+        return (
+            "note: faithful compression is visually lossless, not bit-exact. "
+            "Use --lossless if the archive will be your ONLY copy of "
+            "irreplaceable originals."
+        )
+    return None
+
+
+def _watch_cycles(in_p: Path, out_p: Path, config, *, include_videos: bool,
+                  settle: float, jobs: int = 1, no_progress: bool = False):
+    """The watch-loop engine (ROADMAP 11.1): one compress cycle per next().
+
+    A generator so the caller owns pacing and presentation — the `watch`
+    command sleeps between cycles and prints the summary line; the tray app
+    (facekeep.app, 11.3) waits on a stop event and raises notifications. Each
+    ``next()`` runs exactly one cycle — scan, stability guard, blocked memo,
+    stat pre-filter, batch — and yields a summary dict (keys: ``processed`` /
+    ``ok`` / ``failed`` / ``skipped`` / ``saved`` / ``unchanged`` /
+    ``awaiting`` / ``held``). The 11.1 loop invariants (metadata-only idle
+    cycles, two-scan stability, stat-memoized failures) live HERE so every
+    front end shares them; don't fork a second loop.
+    """
+    video_exts = video_mod.VIDEO_EXTENSIONS if include_videos else set()
+    exts = IMAGE_EXTS | video_exts
+    photo_fp = index_mod.settings_fingerprint(config)
+    video_fp = index_mod.video_settings_fingerprint(config)
+    db_path = out_p / index_mod.INDEX_FILENAME
+
+    prev = None  # previous scan's snapshot (path -> (size, mtime_ns))
+    # Files whose last attempt failed/skipped, memoized by the stat they had:
+    # they are NOT retried every cycle (a corrupt file must not burn CPU per
+    # poll) — only when the file changes. In-memory only: a fresh process (or
+    # each --once run) retries once.
+    blocked: dict = {}
+    while True:
+        stats = _scan_stats(in_p, exts)
+        if prev is None:
+            # Bootstrap: pair the first scan with a settle-delayed second
+            # one, so the first pass can already process files that held
+            # still — --once has only one pass, and loop mode shouldn't
+            # sit a full interval before doing anything.
+            time.sleep(settle)
+            prev = stats
+            stats = _scan_stats(in_p, exts)
+        # Stability guard: a file is eligible only when its size+mtime are
+        # identical across two consecutive scans (temp+rename AND in-place
+        # sync writers both show up as a changing stat while unfinished).
+        eligible = [f for f, s in stats.items() if prev.get(f) == s]
+        awaiting = len(stats) - len(eligible)
+        prev = stats
+
+        blocked = {f: s for f, s in blocked.items() if f in stats}
+        held = [f for f in eligible if blocked.get(f) == stats[f]]
+        check = [f for f in eligible if blocked.get(f) != stats[f]]
+
+        # Stat pre-filter (the idle-cycle cost fix): a file whose recorded
+        # size+mtime+settings still match is skipped without reading a
+        # byte. Only the misses go to the batch (which hashes honestly).
+        todo = []
+        unchanged = 0
+        try:
+            with index_mod.ProcessIndex(db_path) as idx:
+                for f in check:
+                    size, mtime = stats[f]
+                    fp = video_fp if f.suffix.lower() in video_exts else photo_fp
+                    if idx.is_unchanged_stat(f, size, mtime, fp) is not None:
+                        unchanged += 1
+                    else:
+                        todo.append(f)
+        except sqlite3.Error as e:  # a broken cache must never block a run
+            logging.getLogger("facekeep.cli").warning(
+                "watch: unreadable index (%s); checking all files.", e
+            )
+            todo, unchanged = list(check), 0
+
+        n_ok = n_failed = n_skipped = 0
+        saved = 0
+        if todo:
+            code, summary = _run_batch(
+                str(in_p), str(out_p), config, jobs=jobs,
+                no_videos=not include_videos, no_progress=no_progress,
+                only_files=sorted(todo),
+            )
+            if code == 0 and summary:
+                n_ok = summary["ok"]
+                n_failed = summary["failed"]
+                n_skipped = summary["skipped"]
+                unchanged += summary["unchanged"]
+                saved = max(0, summary["total_in"] - summary["total_out"])
+                for f, status in summary["statuses"].items():
+                    if status in ("failed", "failed-unexpected", "skipped"):
+                        blocked[f] = stats.get(f)
+                    else:
+                        blocked.pop(f, None)
+
+        yield {
+            "processed": len(todo), "ok": n_ok, "failed": n_failed,
+            "skipped": n_skipped, "saved": saved, "unchanged": unchanged,
+            "awaiting": awaiting, "held": len(held),
+        }
+
+
+def _watch_cycle_line(cycle: dict, *, interval: "float | None" = None) -> str:
+    """Format one cycle's summary line (ASCII-only for legacy codepages).
+
+    ``interval`` is the next-scan delay to announce, or None in --once mode.
+    """
+    parts = []
+    if cycle["processed"]:
+        done = f"{cycle['ok']} ok"
+        if cycle["failed"]:
+            done += f", {cycle['failed']} failed"
+        if cycle["skipped"]:
+            done += f", {cycle['skipped']} skipped"
+        parts.append(f"processed {cycle['processed']}: {done}")
+        if cycle["saved"]:
+            parts.append(f"saved {_fmt_size(cycle['saved'])}")
+    else:
+        parts.append("idle")
+    if cycle["unchanged"]:
+        parts.append(f"{cycle['unchanged']} unchanged")
+    if cycle["awaiting"]:
+        parts.append(f"{cycle['awaiting']} not yet stable (still syncing?)")
+    if cycle["held"]:
+        parts.append(
+            f"{cycle['held']} failed/skipped earlier "
+            "(retried when the file changes)"
+        )
+    if interval is not None:
+        parts.append(f"next scan in {interval:g}s")
+    return f"[watch {time.strftime('%H:%M:%S')}] " + " | ".join(parts)
+
+
 @cli.command()
 @click.argument("inbox", type=click.Path(exists=True, file_okay=False))
 @click.option("-o", "--output", "output_path", type=click.Path(file_okay=False),
@@ -1455,44 +1625,13 @@ def watch(inbox, output_path, interval, once, settle, mode, preset, codec,
     # Decide video inclusion once, up front, so an excluded class of file is
     # never even scanned (idle cycles stay metadata-only over what matters)
     # and the reason is said once instead of per file per cycle.
-    include_videos = config.video.enabled and not no_videos
-    if include_videos and config.mode == "aggressive":
-        include_videos = False
-        click.echo(
-            "watch: aggressive mode does not apply to video (video is "
-            "faithful-only) - videos in the inbox will be skipped.",
-            err=True,
-        )
-    elif include_videos and not video_mod.ffmpeg_available():
-        include_videos = False
-        click.echo(
-            f"watch: videos in the inbox will be skipped - "
-            f"{video_mod._MISSING_FFMPEG_HINT}",
-            err=True,
-        )
-    video_exts = video_mod.VIDEO_EXTENSIONS if include_videos else set()
-    exts = IMAGE_EXTS | video_exts
+    include_videos, reason = _decide_watch_videos(config, no_videos)
+    if reason:
+        click.echo(reason, err=True)
 
-    # Guardrail 2 honesty (ROADMAP Phase 11): a backup flow must say what the
-    # copy is. Faithful is visually lossless, not bit-exact; aggressive
-    # reconstructs backgrounds on restore.
-    if config.mode == "aggressive":
-        click.echo(
-            "note: aggressive mode reconstructs backgrounds on restore "
-            "(plausible, not faithful). If the archive will be your only "
-            "copy, faithful mode (the default) or --lossless is the honest "
-            "choice."
-        )
-    elif not config.faithful.lossless:
-        click.echo(
-            "note: faithful compression is visually lossless, not bit-exact. "
-            "Use --lossless if the archive will be your ONLY copy of "
-            "irreplaceable originals."
-        )
-
-    photo_fp = index_mod.settings_fingerprint(config)
-    video_fp = index_mod.video_settings_fingerprint(config)
-    db_path = out_p / index_mod.INDEX_FILENAME
+    note = _watch_honesty_note(config)
+    if note:
+        click.echo(note)
 
     click.echo(
         f"Watching {in_p} -> {out_p}"
@@ -1500,103 +1639,16 @@ def watch(inbox, output_path, interval, once, settle, mode, preset, codec,
         + "; sources are never deleted or modified."
     )
 
-    prev = None  # previous scan's snapshot (path -> (size, mtime_ns))
-    # Files whose last attempt failed/skipped, memoized by the stat they had:
-    # they are NOT retried every cycle (a corrupt file must not burn CPU per
-    # poll) — only when the file changes. In-memory only: a fresh process (or
-    # each --once run) retries once.
-    blocked: dict = {}
     exit_code = 0
     try:
-        while True:
-            stats = _scan_stats(in_p, exts)
-            if prev is None:
-                # Bootstrap: pair the first scan with a settle-delayed second
-                # one, so the first pass can already process files that held
-                # still — --once has only one pass, and loop mode shouldn't
-                # sit a full interval before doing anything.
-                time.sleep(settle)
-                prev = stats
-                stats = _scan_stats(in_p, exts)
-            # Stability guard: a file is eligible only when its size+mtime are
-            # identical across two consecutive scans (temp+rename AND in-place
-            # sync writers both show up as a changing stat while unfinished).
-            eligible = [f for f, s in stats.items() if prev.get(f) == s]
-            awaiting = len(stats) - len(eligible)
-            prev = stats
-
-            blocked = {f: s for f, s in blocked.items() if f in stats}
-            held = [f for f in eligible if blocked.get(f) == stats[f]]
-            check = [f for f in eligible if blocked.get(f) != stats[f]]
-
-            # Stat pre-filter (the idle-cycle cost fix): a file whose recorded
-            # size+mtime+settings still match is skipped without reading a
-            # byte. Only the misses go to the batch (which hashes honestly).
-            todo = []
-            unchanged = 0
-            try:
-                with index_mod.ProcessIndex(db_path) as idx:
-                    for f in check:
-                        size, mtime = stats[f]
-                        fp = video_fp if f.suffix.lower() in video_exts else photo_fp
-                        if idx.is_unchanged_stat(f, size, mtime, fp) is not None:
-                            unchanged += 1
-                        else:
-                            todo.append(f)
-            except sqlite3.Error as e:  # a broken cache must never block a run
-                logging.getLogger("facekeep.cli").warning(
-                    "watch: unreadable index (%s); checking all files.", e
-                )
-                todo, unchanged = list(check), 0
-
-            n_ok = n_failed = n_skipped = 0
-            saved = 0
-            if todo:
-                code, summary = _run_batch(
-                    str(in_p), str(out_p), config, jobs=jobs,
-                    no_videos=not include_videos, no_progress=no_progress,
-                    only_files=sorted(todo),
-                )
-                if code == 0 and summary:
-                    n_ok = summary["ok"]
-                    n_failed = summary["failed"]
-                    n_skipped = summary["skipped"]
-                    unchanged += summary["unchanged"]
-                    saved = max(0, summary["total_in"] - summary["total_out"])
-                    for f, status in summary["statuses"].items():
-                        if status in ("failed", "failed-unexpected", "skipped"):
-                            blocked[f] = stats.get(f)
-                        else:
-                            blocked.pop(f, None)
-
-            # The per-cycle summary line (ASCII-only for legacy codepages).
-            parts = []
-            if todo:
-                done = f"{n_ok} ok"
-                if n_failed:
-                    done += f", {n_failed} failed"
-                if n_skipped:
-                    done += f", {n_skipped} skipped"
-                parts.append(f"processed {len(todo)}: {done}")
-                if saved:
-                    parts.append(f"saved {_fmt_size(saved)}")
-            else:
-                parts.append("idle")
-            if unchanged:
-                parts.append(f"{unchanged} unchanged")
-            if awaiting:
-                parts.append(f"{awaiting} not yet stable (still syncing?)")
-            if held:
-                parts.append(
-                    f"{len(held)} failed/skipped earlier "
-                    "(retried when the file changes)"
-                )
-            if not once:
-                parts.append(f"next scan in {interval:g}s")
-            click.echo(f"[watch {time.strftime('%H:%M:%S')}] " + " | ".join(parts))
-
+        for cycle in _watch_cycles(in_p, out_p, config,
+                                   include_videos=include_videos,
+                                   settle=settle, jobs=jobs,
+                                   no_progress=no_progress):
+            click.echo(_watch_cycle_line(
+                cycle, interval=None if once else interval))
             if once:
-                exit_code = 1 if n_failed else 0
+                exit_code = 1 if cycle["failed"] else 0
                 break
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -1990,6 +2042,36 @@ def gui(host, port, share, inbrowser, verbose):
             err=True,
         )
         sys.exit(2)
+
+
+@cli.command()
+@click.option("--selftest", is_flag=True,
+              help="Initialize everything (tray, GUI build, bundled tools) "
+                   "without showing a tray icon, print a report, and exit "
+                   "0/1 - the packaged build's headless smoke test.")
+@click.option("-v", "--verbose", is_flag=True)
+def app(selftest, verbose):
+    """Run the FaceKeep desktop tray app (needs the [app] extra).
+
+    A system-tray shell over `facekeep watch` + the local GUI: the tray icon
+    keeps your inbox folder compressed into the archive in the background
+    (same engine, same guarantees - sources are never deleted or modified),
+    the default menu entry opens the drag-and-drop GUI, and "Start with
+    Windows" makes it fully automatic. Install with: pip install facekeep[app]
+    """
+    _setup_logging(verbose)
+    from . import app as app_mod  # module imports fine without pystray (lazy)
+
+    try:
+        rc = app_mod.run_app(["--selftest"] if selftest else [])
+    except ImportError:
+        click.echo(
+            "The tray app needs pystray, which isn't installed.\n"
+            "  Install it with:  pip install facekeep[app]",
+            err=True,
+        )
+        sys.exit(2)
+    sys.exit(rc)
 
 
 @cli.command()

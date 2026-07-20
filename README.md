@@ -301,6 +301,25 @@ heatmap, and SSIM/PSNR — the interactive sibling of `facekeep compare`. It run
 **locally only** — no public link and no telemetry. (It's a thin wrapper over the
 same engine as the CLI, so the output is identical.)
 
+### Desktop tray app (Windows)
+
+The set-and-forget workflow without a terminal: a system-tray icon keeps your
+inbox folder compressed into the archive in the background (the same
+`facekeep watch` engine), opens the GUI from its menu, can start with Windows,
+and notifies you when a backup cycle finishes or a file fails — idle cycles
+stay silent.
+
+```bash
+pip install "facekeep[app]"
+facekeep app
+```
+
+Or build the **single-install `FaceKeep.exe`** (no Python required —
+PyInstaller, with ffmpeg bundleable for video support) from
+[`packaging/windows/`](packaging/windows/). Sources are never deleted or
+modified, and the app tells you up front that faithful compression is visually
+lossless, not bit-exact — with a Lossless toggle for irreplaceable originals.
+
 ## Usage
 
 ```bash
@@ -352,9 +371,9 @@ restore.
 
 ## Project status
 
-Alpha. Both photo modes, the faithful video re-encode, HDR gain-map carry, and
-`facekeep watch` are implemented and tested; quality tuning and distribution
-(PyPI) are ongoing.
+Alpha. Both photo modes, the faithful video re-encode, HDR gain-map carry,
+`facekeep watch`, and the Windows tray app / packaged build are implemented
+and tested; quality tuning and distribution (PyPI) are ongoing.
 
 ## License
 

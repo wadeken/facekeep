@@ -767,10 +767,47 @@ bit-exact — with a **Lossless** toggle for irreplaceable originals; the tab is
 deliberately faithful-only (aggressive stays on the Compress tab where its
 trade-off is explained per photo), and sources are never deleted or modified.
 The last-used folders persist (best-effort JSON under `~/.cache/facekeep/`) so
-a return visit really is one click. Continuous mode deliberately stays with
-`facekeep watch`: an honest keep-running toggle needs 11.1's loop invariants
+a return visit really is one click. Continuous mode deliberately stays out of
+the browser tab: an honest keep-running toggle needs 11.1's loop invariants
 (stability guard, stat pre-filter) extracted for reuse, not a
-full-hash-every-cycle imitation — a tracked follow-up.
+full-hash-every-cycle imitation — 11.3 did exactly that extraction, and ships
+continuous mode as the tray app below.
+
+**The packaged desktop app (11.3, Windows first).** The last mile for a
+non-Python user: `FaceKeep.exe`, a system-tray app that *is* the effortless
+backup — a tray toggle keeps the inbox compressed into the archive, the
+default menu entry opens the 11.2 GUI, "Start with Windows" makes it fully
+automatic, and each watch cycle that compressed or failed files raises a
+notification (idle cycles never notify — a background app must not spam). It
+is a shell, not a fork: the 11.1 watch loop was extracted verbatim into the
+`cli._watch_cycles` generator (one cycle per `next()`, yielding a summary
+dict; the caller owns pacing and presentation) so the `watch` command and the
+tray's `WatchController` (a daemon thread waiting on a stop event between
+cycles) drive the *same* engine — invariants, output decisions, and all. The
+tray layer (`facekeep/app.py`, the opt-in `[app]` extra = pystray + gradio;
+`facekeep app` for pip users) follows the gui.py discipline: pystray is
+imported lazily, every handler is tray-free and unit-tested, and a missing
+extra prints an install hint. Folders are shared with the GUI Backup tab
+(the same persisted keys — configure once, either place); the watch flow is
+faithful-only with a Lossless menu toggle, and the guardrail-2 honesty note
+is raised when watching starts. Packaging (`packaging/windows/`) is
+PyInstaller: the build venv installs exactly the `[app,heic,progress]`
+surface so **torch/[ai] structurally cannot enter the bundle** (guardrail 4;
+the spec excludes it and the build fails if a torch artifact appears in the
+dist anyway), gradio's assets are collected explicitly, and ffmpeg/libavif
+binaries can be staged into `tools/` — at startup the frozen app points
+`$FACEKEEP_FFMPEG`/`$FACEKEEP_AVIFENC` at them *iff the user hasn't set
+them* (bundling changes availability, never precedence; nothing bundled →
+the normal graceful degradation). The ffmpeg licensing guardrail is
+documented in the packaging README: prefer an LGPL build (BtbN's LGPL
+releases carry libsvtav1 + libvmaf, both BSD — everything FaceKeep uses), or
+knowingly accept GPL obligations. The windowed exe has no console, so stdio
+goes to `~/.cache/facekeep/app.log`, and the build is gated on the frozen
+exe's own headless smoke test (`FaceKeep.exe --selftest` builds the real
+tray menu and the real Gradio Blocks — the check that catches missing
+bundled assets). macOS packaging (signing + notarization need Apple
+credentials) is scoped as its own follow-up once this Windows shape is
+proven.
 
 ## Components
 
@@ -958,7 +995,19 @@ full-hash-every-cycle imitation — a tracked follow-up.
   per-file table + CSV, states the guardrail-2 honesty note with a lossless
   toggle, and persists the last-used folders (`gui_state.json`, best-effort) —
   byte-identical outputs to the CLI, faithful-only, and continuous mode stays
-  with `facekeep watch`.
+  with `facekeep watch` / the tray app.
+- **app.py** — the desktop tray app (`facekeep app`; the `[app]` extra =
+  pystray + gradio; ROADMAP 11.3, Windows-first — see "The packaged desktop
+  app" above). The same lazy-import/pure-handler discipline as gui.py:
+  `WatchController` paces `cli._watch_cycles` on a daemon thread,
+  `FaceKeepApp` holds the tray-free menu handlers (folders shared with the
+  GUI Backup tab via `gui_state.json`; faithful-only watch config with a
+  Lossless toggle; the guardrail-2 note at watch start),
+  `cycle_notification` maps cycle summaries to done/failed toasts (idle =
+  silent), start-with-Windows is an HKCU Run value (`winreg`), and the
+  frozen-build plumbing (`wire_bundled_tools` for the bundled
+  ffmpeg/libavif, stdio → `app.log`, the `--selftest` smoke check) lives
+  here. Packaged by `packaging/windows/` (PyInstaller; never torch).
 
 ## Design principles
 
